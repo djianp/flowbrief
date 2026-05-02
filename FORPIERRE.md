@@ -534,7 +534,7 @@ curl -X POST "https://<n8n-instance>/webhook/paid-conversion" \
 ### Workflow 2: Activation SLA + AI Rescue Loop (FlowBrief)
 
 **ID:** `CJY7NTNz0UCzYxG4`
-**Status:** Inactive (needs OpenAI credential configured)
+**Status:** Active (Published in n8n)
 **Webhook Path:** `/webhook/flowbrief/new-user`
 
 A comprehensive activation monitoring workflow with AI-powered rescue:
@@ -585,7 +585,7 @@ Webhook → Normalize → Slack SLA → Wait 30s → HTTP Status → IF Activate
 | Service | Credential Name | Status |
 | --- | --- | --- |
 | Slack | `Slack - FlowBrief` (ID: rb1PCEAd3QWpcuVE) | ✅ Configured |
-| OpenAI | `OpenAI` | ⚠️ Needs setup in n8n UI |
+| OpenAI | `OpenAI` | ✅ Configured |
 
 **Environment Variables Needed:**
 - `INTERNAL_API_TOKEN` — Used in the `x-internal-token` header for debug endpoint
@@ -638,10 +638,8 @@ These are the n8n management tools available via MCP:
 - [x] **Dual webhook logging** — Every request logs `webhook_received` with metadata; failures also log `webhook_failed` with full context (errorCode, rawBody, headers)
 - [x] **Activation debug endpoint** — Token-protected `/api/activation-debug` endpoint for n8n to fetch diagnostic context
 - [x] **USER\_NOT\_FOUND fix** — Unknown userId no longer crashes with Prisma FK violation; returns clean 404, logs events with `userId: null` + `attemptedUserId` in properties
-
-### In Progress
-- [ ] Configure OpenAI credential for AI Rescue workflow
-- [ ] Test full AI rescue loop end-to-end
+- [x] **OpenAI credential configured + AI rescue loop tested end-to-end** — Workflow 2 is Published in n8n and running successfully
+- [x] **Published to GitHub** — Repo at https://github.com/djianp/flowbrief; README rewritten to lead with the n8n agent story, FlowBrief framed as the substrate
 
 ### Backlog
 - [ ] Add webhook authentication (so only n8n can call the endpoint)
@@ -651,4 +649,4 @@ These are the n8n management tools available via MCP:
 
 ---
 
-*Last updated: February 3, 2026 at 14:00 CET — Added USER\_NOT\_FOUND FK fix documentation, fixed formatting*
+*Last updated: May 2, 2026 at 13:11 CET — Marked Workflow 2 as Active, OpenAI credential as Configured; checked off the rescue-loop E2E test; added GitHub publish to Completed*
