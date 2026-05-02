@@ -6,59 +6,138 @@
 
 ## What Are We Building?
 
-Imagine you have a bunch of automated workflows running in n8n — maybe one that monitors your Stripe payments, another that tracks form submissions, another that watches your calendar. Each of these workflows generates data, but that data just... sits there. You'd have to log into each service, check dashboards, piece together what's happening.
+A **self-healing onboarding agent**.
 
-**FlowBrief is your personal briefing assistant.** It's the glue between your automations and your brain. Your n8n workflows send data to FlowBrief, and it gives you back a human-readable summary: "Hey, you got 3 new payments totaling $147 today. Here's what you should do next."
+Picture this: a customer signs up for your SaaS, pays you money, and now needs to send their first webhook to actually get value out of the product. They open your docs, copy-paste a curl command, and... it fails. They get an error. They try once more, fail again, and quietly close the tab. You won't hear from them again. They'll churn next week.
 
-Think of it like having a personal assistant who reads all your automated notifications and gives you the highlights over coffee.
+That happens to a *lot* of paying customers. The "activation gap" — between signup and first successful action — is where most SaaS revenue dies.
 
----
+**This project closes that gap automatically.** When a new paid user signs up:
 
-## The Big Picture: How Everything Connects
+1. An n8n workflow starts a 45-minute SLA timer.
+2. If they activate (send a valid webhook) in time — Slack notification: "onboarded."
+3. If they don't, the agent pulls their *exact* failure context — the body they sent, the error they got back, the raw headers — and asks GPT-4o to diagnose what went wrong and **draft a personalized rescue email** that names their specific problem.
+4. The draft lands in Slack for the admin to review and send. No generic "having trouble?" — a real, contextual message that the user will actually recognize.
 
-```
-┌─────────────────┐      webhook POST       ┌─────────────────┐
-│                 │ ─────────────────────▶  │                 │
-│   n8n Workflow  │    /api/ingest/:userId  │   FlowBrief     │
-│                 │                         │                 │
-└─────────────────┘                         └────────┬────────┘
-                                                     │
-                                            ┌────────┴────────┐
-                                            │   Validation    │
-                                            │   Layer         │
-                                            └────────┬────────┘
-                                                     │
-                                          ┌──────────┴──────────┐
-                                          │                     │
-                                    ❌ Invalid              ✅ Valid
-                                          │                     │
-                                          ▼                     ▼
-                                   ┌─────────────┐      ┌─────────────┐
-                                   │ Structured  │      │  SQLite DB  │
-                                   │ Error + Log │      │ (via Prisma)│
-                                   └─────────────┘      └──────┬──────┘
-                                                               │
-                                                               ▼
-                                                       ┌─────────────┐
-                                                       │  Dashboard  │
-                                                       │ (React/Next)│
-                                                       └─────────────┘
-```
+The interesting thing is **the agent**, not the email. Anyone can write a "send help email" cron job. The thing here is that the email knows what the user actually did wrong, because the API was designed to give the agent everything it needs to know.
 
-Here's the flow:
-
-1. **Your n8n workflow** finishes doing something (payment received, form submitted, whatever)
-2. **It POSTs the data** to your personal webhook URL: `/api/ingest/YOUR_USER_ID`
-3. **FlowBrief validates** the request through multiple layers (method, content-type, size, JSON, schema)
-4. **If invalid:** Returns a structured error with `errorCode` + `errorDetails`, logs `webhook_failed`
-5. **If valid:** Saves the payload as a "Brief", logs `webhook_received`
-6. **You see it** on your dashboard, nicely formatted
+**FlowBrief itself** — the Next.js webhook-receiving SaaS — is the substrate the agent operates on. It receives the user's webhooks, validates them, logs failures with structured context, and exposes a debug endpoint the agent reads from. The Next.js app is intentionally minimal. The agent is the point.
 
 ---
 
-## The Tech Stack (And Why We Chose It)
+## The Big Picture
 
-### Next.js 16 with App Router
+```
+                  NEW PAID SIGNUP
+                          │
+                          ▼
+   ┌────────────────────────────────────────────┐
+   │  n8n: paid-conversion workflow             │
+   │  Slack: "New user, SLA starts now"         │
+   │  Wait 45 min                               │
+   └─────────────────┬──────────────────────────┘
+                     │
+                     ▼
+              has the user sent a valid webhook?
+              (GET /api/activation-status)
+                     │
+         ┌───────────┴───────────┐
+         │                       │
+    YES, activated           NO, stuck
+         │                       │
+         ▼                       ▼
+   Slack: 🎉 onboarded     ┌─────────────────────────────────┐
+                           │ GET /api/activation-debug       │
+                           │ (token-protected; returns       │
+                           │  errorCode, rawBody, headers,   │
+                           │  recent failures)               │
+                           └──────────────┬──────────────────┘
+                                          ▼
+                           ┌─────────────────────────────────┐
+                           │ Switch on errorCode:            │
+                           │  → MISSING_REQUIRED_FIELD       │
+                           │  → INVALID_JSON                 │
+                           │  → UNSUPPORTED_CONTENT_TYPE     │
+                           │  → ...                          │
+                           │ Set per-error fix hint          │
+                           └──────────────┬──────────────────┘
+                                          ▼
+                           ┌─────────────────────────────────┐
+                           │ OpenAI (GPT-4o):                │
+                           │  · root cause analysis          │
+                           │  · concrete fix steps           │
+                           │  · DRAFT EMAIL (subject + body) │
+                           │    addressed to this user       │
+                           └──────────────┬──────────────────┘
+                                          ▼
+                           Slack: diagnosis + ready-to-send draft
+                                          │
+                                          ▼
+                                wait 30s, re-check status
+                                          │
+                               ┌──────────┴──────────┐
+                               ▼                     ▼
+                          recovered ✅          still stuck ⚠️
+                                                 → escalate
+```
+
+This is the entire product. The Next.js app in `/src` exists to make this loop possible — it's the data source the agent reads from and the validation layer that produces the structured error codes the agent branches on.
+
+---
+
+## Why This Is Worth Building
+
+A bit of SaaS-funnel context, because this is the actual product insight:
+
+**Activation** is the moment a user does the first key thing your product is supposed to do. For FlowBrief, that's sending their first valid webhook. Until that happens, nothing useful has occurred — they signed up, they paid, they... bounced off your getting-started docs.
+
+The activation gap (signup → first success) is where the majority of SaaS churn happens. A user who completes activation in their first session retains dramatically better than one who comes back the next day to "try again later" (they don't).
+
+**The traditional rescue:** at T+24h, send a generic "having trouble?" email. The user reads "having trouble?" and thinks "I guess?" and closes it. The email had no idea what their actual problem was.
+
+**The agent rescue:** at T+45min, look at *exactly* what the user tried, what error came back, what they were probably trying to do — then write them an email that names their specific failure and tells them how to fix it. The user reads "Your webhook on Feb 2 sent `Content-Type: text/plain` instead of `application/json`. Here's the fixed curl command." and thinks "oh, that's a different kind of email."
+
+That difference — generic vs. specific — is what makes this whole project earn its keep.
+
+---
+
+## The Stack
+
+Two halves, both equally load-bearing. The agent half does the work; the substrate half makes the agent's work possible.
+
+### The agent half: n8n + Synta MCP + OpenAI
+
+**Why n8n?**
+
+Could we have written the agent as a plain Node script on a cron? Technically yes. We didn't, for three reasons:
+
+1. **Visual debugging beats logs.** When a workflow fails, n8n shows you exactly which node failed, what its input was, and what its output (or error) was. You don't have to grep logs to figure out "did the OpenAI call timeout, or did the JSON parse choke?" — you can see it at a glance.
+2. **Built-in nodes for the boring stuff.** Webhook receivers, Wait nodes, Slack messages, OpenAI calls, HTTP requests with retry and auth handling — all out of the box. We're not writing OAuth flows for Slack or rate-limit handlers for OpenAI.
+3. **Webhooks are first-class.** Every workflow can expose its own webhook URL. The "paid conversion" workflow listens at `/webhook/paid-conversion`; the rescue workflow listens at `/webhook/flowbrief/new-user`. No reverse proxy config, no Express boilerplate.
+
+The trade-off: n8n workflows live as JSON inside n8n's database, not in Git. They're harder to version-control and harder to test in isolation. For a high-stakes production pipeline you'd want both. For an activation-rescue agent, the velocity gain is worth it.
+
+**Why Synta MCP?**
+
+Without it, the workflow lives in n8n's UI. You build it by clicking nodes together — fast for the first version, painful for iteration, no diff.
+
+With Synta MCP, Claude Code can:
+- Read the workflow's JSON definition (`n8n_get_workflow`)
+- Add or remove nodes incrementally (`n8n_update_partial_workflow`)
+- Validate before deploying (`n8n_validate_workflow`)
+- Auto-fix common config issues (`n8n_autofix_workflow`)
+
+This effectively turns the n8n workflow into something we can edit like code, in a conversation. The agent's design lives in this journal *and* in the Synta MCP commands we ran — not just in clicked-together state hidden in n8n.
+
+**Why GPT-4o?**
+
+It's reliable enough at structured-to-natural-language translation, returns valid JSON when asked, and is fast and cheap enough for low-volume rescue emails. We're not asking it to plan or to act autonomously — just to translate structured failure data into a human email. That's a job it does well.
+
+### The substrate half: Next.js 16 + SQLite + Prisma + NextAuth v5
+
+The webhook-receiving side. Intentionally minimal.
+
+#### Next.js 16 with App Router
 
 We're using the latest Next.js with the App Router pattern. Why?
 
@@ -78,7 +157,7 @@ export default async function DashboardPage() {
 }
 ```
 
-### TypeScript
+#### TypeScript
 
 JavaScript but with guardrails. When you define a Brief like this:
 
@@ -91,9 +170,9 @@ interface Brief {
 }
 ```
 
-...the compiler catches mistakes before they blow up at runtime. Tried to access `brief.sumarryText` (typo)? TypeScript screams at you. Saved me hours of debugging.
+...the compiler catches mistakes before they blow up at runtime. Tried to access `brief.sumarryText` (typo)? TypeScript screams at you. Saved hours of debugging.
 
-### SQLite + Prisma
+#### SQLite + Prisma
 
 For a project like this, SQLite is perfect. It's just a file. No Docker containers, no database servers, no connection strings to manage. Your entire database lives in `prisma/dev.db`.
 
@@ -113,456 +192,21 @@ await prisma.brief.create({
 
 Same result, but type-safe, readable, and the schema is version-controlled.
 
-### NextAuth v5 (Beta)
+#### NextAuth v5 (Beta)
 
 Authentication is one of those things that seems simple ("just check if they're logged in!") until you try to build it yourself. Sessions, tokens, password hashing, CSRF protection... it's a minefield.
 
-NextAuth handles all of it. You configure your "providers" (we use credentials — email/password), and it gives you:
-- A `signIn()` function
-- A `signOut()` function
-- An `auth()` function that returns the current session
-- Protected API routes
-- Session management with JWTs
+NextAuth handles all of it. We use the credentials provider (email/password), and it gives us `signIn()`, `signOut()`, an `auth()` function that returns the current session, protected API routes, and JWT-based session management.
 
-**Why v5 (beta)?** It's the version that works well with Next.js App Router. The stable v4 was designed for Pages Router and has friction with the new patterns.
+**Why v5 (beta)?** It's the version that works well with App Router. The stable v4 was designed for Pages Router and has friction with the new patterns.
 
 ---
 
-## The Codebase: A Guided Tour
+## The AI Rescue Agent: A Deep Dive
 
-### `/src/lib` — The Brains
+Two workflows, both running in n8n.
 
-This is where the business logic lives. These files don't know about HTTP or React — they just do their job.
-
-**`prisma.ts`** — A singleton for the database connection. "Singleton" means there's only one instance, shared everywhere. Without this, each request would open a new database connection, and we'd run out.
-
-**`auth.ts`** — Configures NextAuth. Defines how login works, what happens after login, how sessions are stored.
-
-**`briefs.ts`** — Functions for creating and fetching briefs. `createBrief()`, `getUserBriefs()`, `getLastSuccessBrief()`. Pure logic, no HTTP.
-
-**`webhook-errors.ts`** — The `ErrorCode` enum and response helper functions. Defines all the ways a webhook can fail (`INVALID_JSON`, `MISSING_REQUIRED_FIELD`, etc.) and provides `createErrorResponse()` / `createSuccessResponse()` for consistent formatting.
-
-**`webhook-validation.ts`** — Payload schema validation. Defines what a valid webhook payload looks like (required: `title`, `content`; optional: `source`, `timestamp`) and validates incoming data against it.
-
-**`request-utils.ts`** — Utilities for safely reading request bodies and extracting metadata for logging:
-- `truncate(str, maxLen)` — Safely truncate strings (used for rawBody in failure logs)
-- `pickHeaders(headers)` — Extract only whitelisted headers (content-type, user-agent, x-flowbrief-signature, x-forwarded-for)
-- `safeReadBody(request)` — Read request body once without throwing (returns null on failure)
-- `extractRequestMeta(request, rawBody)` — Build metadata object for `webhook_received` events
-- `buildFailureProperties(...)` — Build full context for `webhook_failed` events
-
-**`events.ts`** — Analytics/logging. Every webhook received, every brief generated — we log it. Useful for debugging.
-
-**`ai.ts`** — The AI integration (currently unused in the ingest path, but available for future features). Has a graceful fallback pattern if OpenAI isn't configured.
-
-### `/src/app/api` — The Endpoints
-
-Each folder here becomes an API route.
-
-**`/api/ingest/[userId]/route.ts`** — The star of the show. This is where n8n sends data. The `[userId]` is a dynamic segment — the URL `/api/ingest/abc123` will receive `userId = "abc123"` as a parameter.
-
-This endpoint implements a strict validation pipeline:
-
-1. **Method check** — Only POST allowed (returns `INVALID_METHOD` for GET/PUT/DELETE/PATCH)
-2. **User check** — userId must exist in database (returns `USER_NOT_FOUND` 404). Done early so all logging uses a FK-safe userId.
-3. **Content-Type check** — Must be `application/json` (returns `UNSUPPORTED_CONTENT_TYPE`)
-4. **Size check** — Max 20KB via header AND body (returns `PAYLOAD_TOO_LARGE`)
-5. **JSON parse** — Body must be valid JSON (returns `INVALID_JSON`)
-6. **Schema validation** — Must have `title` and `content` fields (returns `MISSING_REQUIRED_FIELD` or `INVALID_FIELD_TYPE`)
-7. **Logging** — Every request logs `webhook_received`; failures also log `webhook_failed` with error details. Unknown users get `userId: null` with `attemptedUserId` in properties.
-8. **Save** — Valid payloads are stored as Briefs
-9. **Return** — `{ ok: true }` on success, `{ ok: false, errorCode, errorDetails }` on failure
-
-**`/api/test-payload/route.ts`** — Calls the ingest endpoint with fake data. Great for testing without setting up n8n.
-
-**`/api/activation-status/route.ts`** — Returns whether a user has successfully received their first brief. The dashboard uses this to show "Set up your webhook!" vs "You're all set!"
-
-**`/api/activation-debug/route.ts`** — A token-protected endpoint for n8n to fetch detailed debug context when activation fails. Requires `x-internal-token` header matching `INTERNAL_API_TOKEN` env var. Returns:
-- `activated`: whether user has at least one SUCCESS brief
-- `lastAttemptAt`: most recent webhook attempt
-- `lastFailure`: full context of most recent `webhook_failed` event (errorCode, errorDetails, rawBody, headers)
-- `recentFailures`: last 5 failures with timestamps and error codes
-- `lastReceived`: most recent `webhook_received` event metadata
-
-This is what the AI Rescue workflow calls to diagnose why activation failed.
-
-### `/src/app/dashboard` — The UI
-
-**`page.tsx`** — A server component that fetches briefs and renders the dashboard. It imports all the client components (buttons, lists) and passes them data.
-
-**`briefs-list.tsx`** — Renders a list of briefs with their status, summary, and action items.
-
-**`webhook-url.tsx`** — Displays your personal webhook URL with a copy button.
-
-**`test-payload-button.tsx`** — Calls `/api/test-payload` to trigger a test brief.
-
-**`sign-out-button.tsx`** — A client component (needs `"use client"` because it uses `onClick`).
-
-### The Pattern: Server Components + Client Components
-
-Notice how `page.tsx` doesn't have `"use client"` at the top? It's a **server component**. It can:
-- Be `async`
-- Fetch data directly with `await`
-- Access the database
-- Use secrets (environment variables)
-
-But it can NOT:
-- Use `useState` or `useEffect`
-- Handle click events
-- Use browser APIs
-
-For interactivity, we create **client components** (marked with `"use client"`). The server component renders them and passes data as props.
-
-```tsx
-// Server component
-export default async function DashboardPage() {
-  const briefs = await getUserBriefs(userId);  // runs on server
-  return <BriefsList briefs={briefs} />;       // passes data to client
-}
-
-// Client component
-"use client";
-export function BriefsList({ briefs }) {
-  // Can use useState, onClick, etc. here
-}
-```
-
-This separation is powerful. The server does the heavy lifting, the client handles interactivity. Best of both worlds.
-
----
-
-## Lessons Learned
-
-### The Activation Status Bug (Current Branch: `feature/activation-debug`)
-
-*This section will be updated as we debug...*
-
-We have an endpoint `/api/activation-status` that tells us if a user's webhook is "activated" (has successfully processed at least one brief). The dashboard was supposed to show different states:
-- "Not yet activated" → Set up your webhook!
-- "Activated" → You're all set, here are your briefs
-
-Somewhere, something isn't quite working. The debugging process is a lesson in itself:
-
-1. **Start from the data.** What's actually in the database? Use `npm run db:studio` to inspect.
-2. **Trace the request.** Add `console.log()` statements at each step.
-3. **Test in isolation.** Hit the API directly with `curl` before blaming the frontend.
-
-### SQLite + JSON: The Stringify Dance
-
-SQLite doesn't have a native JSON column type. So we store JSON as strings:
-
-```typescript
-// Saving
-inputJson: JSON.stringify(payload)
-
-// Reading
-JSON.parse(brief.inputJson)
-```
-
-It's slightly annoying, but it works. The pitfall: forget to parse and you'll get `"[object Object]"` everywhere.
-
-**Lesson:** When using SQLite with JSON data, create helper functions that handle the conversion, so you don't have to remember every time.
-
-### NextAuth v5 Session Quirk
-
-By default, NextAuth uses database sessions. But with credentials auth (email/password), we need **JWT sessions**. Why? Database sessions require a session token stored in a cookie AND the database. JWTs are self-contained — the session lives entirely in the cookie.
-
-```typescript
-export const { auth } = NextAuth({
-  session: { strategy: "jwt" },  // <-- This line is crucial
-  // ...
-});
-```
-
-Without this, you'll get cryptic errors about missing session tokens.
-
-### The Graceful Fallback Pattern
-
-Look at `ai.ts`:
-
-```typescript
-export async function generateBrief(inputJson: unknown): Promise<BriefResult> {
-  const openaiKey = process.env.OPENAI_API_KEY;
-
-  if (openaiKey) {
-    return generateWithOpenAI(inputJson, openaiKey);
-  }
-
-  return generateFallback(inputJson);  // Works without API key!
-}
-```
-
-This is a **graceful degradation** pattern. The app doesn't break if OpenAI isn't configured — it just does something simpler. Benefits:
-- New developers can run the project immediately (no API key signup required)
-- If OpenAI goes down, the app still works
-- Tests don't need mocked API responses
-
-**Lesson:** Always ask "What if this dependency fails?" and have a fallback plan.
-
-### Error Taxonomy: Speaking n8n's Language
-
-*Added: February 2, 2026*
-
-When we first built the webhook endpoint, errors looked like this:
-
-```json
-{ "ok": false, "error": "Invalid JSON payload" }
-```
-
-Simple, human-readable... and useless for automation. If an n8n workflow received this, what could it do? Log it and give up? Send a generic alert?
-
-We needed **structured errors** — a vocabulary that both humans and machines understand. So we created an `ErrorCode` enum:
-
-```typescript
-export enum ErrorCode {
-  INVALID_JSON = "INVALID_JSON",
-  UNSUPPORTED_CONTENT_TYPE = "UNSUPPORTED_CONTENT_TYPE",
-  MISSING_REQUIRED_FIELD = "MISSING_REQUIRED_FIELD",
-  INVALID_FIELD_TYPE = "INVALID_FIELD_TYPE",
-  PAYLOAD_TOO_LARGE = "PAYLOAD_TOO_LARGE",
-  INVALID_METHOD = "INVALID_METHOD",
-  UNAUTHORIZED = "UNAUTHORIZED",
-  USER_NOT_FOUND = "USER_NOT_FOUND",
-}
-```
-
-Now n8n can do this:
-
-```
-IF errorCode == "MISSING_REQUIRED_FIELD" → Send user an email with field requirements
-IF errorCode == "INVALID_JSON" → Send user a JSON formatter link
-IF errorCode == "UNAUTHORIZED" → Check if userId is correct in their config
-```
-
-The `errorDetails` object provides context without breaking the contract:
-
-```json
-{
-  "ok": false,
-  "errorCode": "MISSING_REQUIRED_FIELD",
-  "errorDetails": {
-    "field": "title",
-    "message": "Required field 'title' is missing"
-  }
-}
-```
-
-**The lesson:** When building APIs for automation, think about the *consumer* of your errors. Strings are for humans. Codes are for machines. You need both.
-
-### The Payload Schema: Required vs Optional
-
-We also defined a minimal schema for webhook payloads:
-
-```typescript
-interface WebhookPayload {
-  title: string;      // Required: What is this about?
-  content: string;    // Required: The actual data/message
-  source?: string;    // Optional: Where did this come from?
-  timestamp?: string; // Optional: When did it happen? (ISO 8601)
-}
-```
-
-Why these fields?
-
-- **`title`** — Every brief needs a headline. This becomes the `summaryText` in the database.
-- **`content`** — The actual information. Can be as short or long as needed (up to 20KB).
-- **`source`** — Useful for filtering/grouping. "Was this from Stripe? Calendar? Forms?"
-- **`timestamp`** — When the event *actually* happened, not when we received it. Important for audit trails.
-
-The timestamp validation is strict — it must be a valid ISO 8601 string (`2026-02-02T15:30:00.000Z`). No loose date parsing, no timezone ambiguity. This prevents subtle bugs where "2/2/26" means different things to different systems.
-
-### Payload Size Limits: Defense in Depth
-
-The ingest endpoint checks payload size twice (limit: **20KB**):
-
-```typescript
-const MAX_PAYLOAD_SIZE = 20 * 1024; // 20KB
-
-// First check: Content-Length header (fast, before reading body)
-const contentLength = request.headers.get("content-length");
-if (contentLength && parseInt(contentLength) > MAX_PAYLOAD_SIZE) { ... }
-
-// Second check: Actual body length (after reading)
-if (rawBody.length > MAX_PAYLOAD_SIZE) { ... }
-```
-
-Why both? The `Content-Length` header can be spoofed or missing. A malicious request could say "I'm 100 bytes" but send 100MB. The header check is fast (doesn't read the body), but we verify after reading too.
-
-Why 20KB? It's enough for any reasonable webhook payload (a Stripe event is ~2KB, a form submission ~1KB), but small enough to prevent abuse. If someone genuinely needs to send more, they should rethink their data model.
-
-**Lesson:** Never trust client-supplied data. Validate at multiple levels.
-
-### Dual Logging: Received vs Failed
-
-The ingest endpoint logs two different events:
-
-```typescript
-// Always logged (even for invalid requests)
-await logEvent({ userId, eventName: "webhook_received", ... });
-
-// Only logged when validation fails
-await logEvent({ userId, eventName: "webhook_failed", ... });
-```
-
-Why both?
-
-- **`webhook_received`** answers: "Did the request reach us?" Useful for debugging network issues.
-- **`webhook_failed`** answers: "Why did it fail?" Contains the error code, details, raw body, and headers.
-
-The `webhook_failed` event captures the full request context — including the raw body (truncated to 20KB) and whitelisted headers. This means when n8n's rescue workflow checks why activation failed, it has everything it needs to diagnose the problem without asking the user to reproduce it.
-
-**Lesson:** Log at the boundaries of your system. Capture enough context to debug without the user's help.
-
-### The Foreign Key Crash: USER_NOT_FOUND (Bug Fix)
-
-*Added: February 3, 2026*
-
-This one was a real "oh no" moment. We discovered that hitting `/api/ingest/fake-user-id` with a userId that doesn't exist would crash with a Prisma error:
-
-```
-P2003: Foreign key constraint violated on the field `Event_userId_fkey`
-```
-
-**What happened:** Our `Event` table has a foreign key from `Event.userId` to `User.id`. The ingest route was calling `logEvent({ userId: "fake-user-id", ... })` *before* checking if the user exists — and Prisma rightfully refused to insert an Event pointing to a non-existent User.
-
-It's like trying to file a document in a cabinet drawer that doesn't exist. The database said "nope."
-
-**The fix was about \*ordering***** and \*****nullability**\***:**
-
-1. **Move the user check to the top.** Before logging anything, check if the user exists.
-2. **Compute a "safe" userId:** If user exists, use their real id. If not, use `undefined` (which Prisma stores as `null`).
-3. **Stash the attempted id in properties:** So we don't lose the forensic trail — the `attemptedUserId` is preserved in the event's JSON.
-
-```typescript
-const user = await prisma.user.findUnique({ where: { id: paramUserId } });
-const safeUserId = user ? paramUserId : undefined;
-
-// Now safe to log — userId is either valid or null
-await logWebhookReceived(safeUserId, paramUserId, request, rawBody);
-```
-
-We also added `USER_NOT_FOUND` as a proper error code (with HTTP 404) instead of the previous `UNAUTHORIZED` (401). "Unauthorized" implies bad credentials; "User not found" is the accurate diagnosis.
-
-**Lesson:** When your database has foreign keys, you need to validate references *before* inserting. This sounds obvious in hindsight, but it's easy to miss when the "insert" is buried inside a helper function (like `logEvent`). Think about the order of operations: validate first, log safely, then fail with a clear message.
-
-### Build Agents as Pipelines, Not as Black Boxes
-
-*Added: May 2, 2026*
-
-This one is the biggest takeaway from building the rescue workflow, and it's worth pulling out from the n8n section because it generalizes.
-
-The seductive thing about LLMs is that they can do *anything*. So when you build an "AI agent," the temptation is to point a giant prompt at the model and let it figure things out — which user, which error, which response, all in one shot.
-
-That works in demos. In production, it's a debugging nightmare. When the output is wrong, you can't tell which part of the reasoning broke. When you need to handle a new edge case, you can't tell whether to reprompt or restructure. The LLM's opacity becomes *your* opacity.
-
-**The fix is to constrain the LLM to one well-scoped job.** In our rescue workflow:
-
-- The webhook receipt is plain HTTP — no LLM.
-- Pulling the user's debug context is a structured API call — no LLM.
-- Branching on the known `errorCode` is a Switch node — no LLM.
-- Posting to Slack is a Slack node — no LLM.
-- Re-checking activation is plain HTTP — no LLM.
-
-The LLM is invoked once, at one step, with structured input (user info + error type + raw failed request) and a structured output contract (JSON with `diagnosis`, `fixSteps`, `email.subject`, `email.body`). It does the one thing it's uniquely good at: turning that structured input into natural-language text addressed to a specific human.
-
-Everything else is plumbing — and plumbing is *fixable* in a way that "the LLM did something weird" isn't.
-
-**Lesson:** Treat the LLM like a function in your pipeline, not like a brain you delegate to. Wrap it tightly: structured input, structured output, validation on both sides, and as little context as the job actually requires. The agent's intelligence comes from the pipeline's *shape*, not from the LLM doing more.
-
----
-
-## How Good Engineers Think
-
-### Start Simple, Add Complexity Only When Needed
-
-FlowBrief started as:
-1. An endpoint that receives JSON
-2. A database to store it
-3. A page to display it
-
-No AI summarization at first. No auth. No event tracking. Each feature was added when there was a clear need. This is called **YAGNI** — "You Aren't Gonna Need It." Build what you need today.
-
-### Separation of Concerns
-
-Notice how `/lib/briefs.ts` doesn't know about HTTP? It just has functions like `createBrief(data)`. The API route calls these functions and handles the HTTP stuff (status codes, headers, JSON responses).
-
-If tomorrow we wanted a CLI tool that creates briefs, we could import `createBrief()` and use it directly. The logic isn't trapped inside an HTTP handler.
-
-### Fail Fast, Fail Loudly
-
-Look at the ingest endpoint's validation:
-
-```typescript
-if (!contentType.includes("application/json")) {
-  return NextResponse.json(
-    createErrorResponse(ErrorCode.UNSUPPORTED_CONTENT_TYPE, {
-      expected: "application/json",
-      received: contentType || "none",
-    }),
-    { status: 415 }
-  );
-}
-```
-
-It doesn't try to "be helpful" and guess the content type. If something's wrong, it fails immediately with a **structured error**. The response always looks like:
-
-```json
-{
-  "ok": false,
-  "errorCode": "UNSUPPORTED_CONTENT_TYPE",
-  "errorDetails": { "expected": "application/json", "received": "text/plain" }
-}
-```
-
-This is crucial for automation. n8n workflows can now branch on `errorCode` and take different actions for different failure types. A human-readable error message is nice, but a machine-readable error code is essential for building reliable integrations.
-
----
-
-## n8n Workflows (via Synta MCP)
-
-*Added: February 2, 2026*
-
-The n8n workflows aren't a side-project — they're the **point** of FlowBrief. The Next.js app is just the substrate the agent operates on. So this section is the most important part of the journal.
-
-### Why n8n?
-
-Could we have written all of this as plain Node scripts on a cron? Technically yes. We didn't, for three reasons:
-
-**1. Visual debugging beats logs.** When a workflow fails, n8n shows you exactly which node failed, what its input was, and what its output (or error) was. You don't have to grep logs to figure out "did the OpenAI call timeout, or did the JSON parse choke?" — you can see it.
-
-**2. Built-in nodes for the boring stuff.** Webhook receivers, Wait nodes, Slack messages, OpenAI calls, HTTP requests with retry/auth handling — all out of the box. We're not writing OAuth flows for Slack or rate-limit handlers for OpenAI.
-
-**3. Webhooks are first-class.** Every n8n workflow can expose its own webhook URL. The "paid conversion" workflow listens at `/webhook/paid-conversion`; the rescue workflow listens at `/webhook/flowbrief/new-user`. No reverse proxy config, no Express boilerplate.
-
-The trade-off: n8n workflows are stored as JSON in n8n's database, not in Git. They're harder to version-control and harder to test in isolation. For a high-stakes pipeline you'd want both. For an activation-rescue agent, the velocity gain is worth it.
-
-### Why Synta MCP?
-
-Without it, the workflow lives in n8n's UI. You build it by clicking nodes together, which is fast for the first version but painful for iteration — every change is a manual UI action, and there's no diff.
-
-With Synta MCP, Claude Code can:
-- Read the workflow's JSON definition (`n8n_get_workflow`)
-- Add or remove nodes incrementally (`n8n_update_partial_workflow`)
-- Validate before deploying (`n8n_validate_workflow`)
-- Auto-fix common config issues (`n8n_autofix_workflow`)
-
-Effectively it turns the n8n workflow into something we can edit like code, in a conversation. The agent's design lives in this journal and in the Synta MCP commands we ran — not just in clicked-together state hidden in n8n.
-
-### Why activation rescue specifically?
-
-A bit of SaaS-funnel context, because this is the actual product insight:
-
-**Activation** is the moment a user does the first key thing your product is supposed to do. For FlowBrief, that's sending their first valid webhook. Until that happens, nothing useful has occurred — they signed up, they paid, they... bounced off your getting-started docs.
-
-The activation gap (signup → first success) is where the majority of SaaS churn happens. A user who completes activation in their first session retains dramatically better than one who comes back the next day to "try again later" (they don't).
-
-**The traditional rescue:** at T+24h, send a generic "having trouble?" email. The user reads "having trouble?" and thinks "I guess?" and closes it. The email had no idea what their actual problem was.
-
-**The agent rescue:** at T+45min (or whatever the SLA is), look at *exactly* what the user tried, what error came back, what they were probably trying to do — then write them an email that names their specific failure and tells them how to fix it. The user reads "Your webhook on Feb 2 sent `Content-Type: text/plain` instead of `application/json`. Here's the fixed curl command." and thinks "oh, that's a different kind of email."
-
-That difference — generic vs. specific — is what makes the LLM step earn its keep.
-
-### Workflow 1: Paid conversion → Activation rescue loop (FlowBrief)
+### Workflow 1: Paid conversion → Activation rescue (simple)
 
 **ID:** `Xs7MPdACbBYwXruW`
 **Status:** Active
@@ -584,22 +228,23 @@ Webhook (POST) → Slack Notify → Wait 45m → HTTP Check Activation → IF Ac
 4. Checks `/api/activation-status?userId={userId}`
 5. Posts success or failure message to Slack
 
+This is the minimal version — yes/no check, Slack notification, done. It's useful as a baseline (you always know whether activation happened) but it doesn't *do* anything about failures. That's what Workflow 2 adds.
+
 **Test with:**
+
 ```bash
 curl -X POST "https://<n8n-instance>/webhook/paid-conversion" \
   -H "Content-Type: application/json" \
   -d '{"userId": "user-123", "email": "test@example.com", "plan": "pro"}'
 ```
 
----
-
-### Workflow 2: Activation SLA + AI Rescue Loop (FlowBrief)
+### Workflow 2: Activation SLA + AI Rescue Loop (the full agent)
 
 **ID:** `CJY7NTNz0UCzYxG4`
 **Status:** Active (Published in n8n)
 **Webhook Path:** `/webhook/flowbrief/new-user`
 
-A comprehensive activation monitoring workflow with AI-powered rescue:
+The full agent. Same SLA monitor as Workflow 1, but on failure it pulls full debug context, branches on the structured error code, asks GPT-4o for a personalized rescue email, posts the draft to Slack, then re-checks activation after a short wait.
 
 ```
 Webhook → Normalize → Slack SLA → Wait 30s → HTTP Status → IF Activated?
@@ -633,43 +278,43 @@ Webhook → Normalize → Slack SLA → Wait 30s → HTTP Status → IF Activate
                                                   Succeeded      Escalate
 ```
 
-**Key Features:**
+**Key features:**
+
 - **Normalize input node** extracts `userId`, `email`, `plan`, plus sets `flowbriefBaseUrl` and `internalToken` (from env)
 - **Error code branching** provides specific fix suggestions per error type
-- **AI diagnosis** uses GPT-4o to analyze the failure and generate:
-  - Root cause analysis
-  - Fix steps
-  - Example curl command
-  - Draft rescue email (subject + body)
-- **Retry loop** checks activation again after sending rescue instructions
+- **AI diagnosis** uses GPT-4o to analyze the failure and generate root cause, fix steps, example curl, and a draft rescue email
+- **Retry loop** checks activation again after the rescue message lands
 
 **Credentials Used:**
+
 | Service | Credential Name | Status |
 | --- | --- | --- |
 | Slack | `Slack - FlowBrief` (ID: rb1PCEAd3QWpcuVE) | ✅ Configured |
 | OpenAI | `OpenAI` | ✅ Configured |
 
 **Environment Variables Needed:**
-- `INTERNAL_API_TOKEN` — Used in the `x-internal-token` header for debug endpoint
 
-**Wait Times (for testing):**
-Both Wait nodes are set to **30 seconds**. To change to production (45 minutes):
+- `INTERNAL_API_TOKEN` — Used in the `x-internal-token` header for `/api/activation-debug`
+
+**Wait times — dev vs prod:**
+
+Both Wait nodes are set to **30 seconds** for testing. Production wants **45 minutes**:
+
 - Open workflow in n8n
 - Edit "Wait - Activation SLA" and "Wait - Retry" nodes
 - Change `amount` to 45, `unit` to "minutes"
 
+(This dev/prod toggle is currently manual. The right long-term fix is to read the duration from a workflow variable.)
+
 **Test with:**
+
 ```bash
 curl -X POST "https://<n8n-instance>/webhook-test/flowbrief/new-user" \
   -H "Content-Type: application/json" \
   -d '{"userId": "user-123", "email": "test@example.com", "plan": "pro"}'
 ```
 
----
-
----
-
-### Designing the AI Rescue Agent: Deterministic-then-LLM
+### Designing the Agent: Deterministic-then-LLM
 
 This is the most interesting design decision in the whole project, so it deserves its own section.
 
@@ -723,7 +368,7 @@ The LLM only does what only an LLM can do: turn structured failure data into nat
 
 This is the inverse of how most "agent" demos look, where the LLM is the centerpiece and everything is plumbing. Here the LLM is the plumbing — the centerpiece is the pipeline.
 
-### Pitfalls we hit (and you will too)
+### Pitfalls We Hit (and you will too)
 
 **LLM JSON parsing is fragile.** Even with `response_format: json_object`, models sometimes prefix output with "Here's the JSON:" or wrap it in ```json fences. The "Parse AI JSON" node strips those before parsing, and fails fast (with a useful error) if parsing breaks. Don't try to recover from malformed LLM JSON — surface it.
 
@@ -733,7 +378,406 @@ This is the inverse of how most "agent" demos look, where the LLM is the centerp
 
 ---
 
-### Synta MCP Tools Reference
+## The FlowBrief API: What the Agent Reads
+
+The agent only works because the API was designed to give it the context it needs. Each endpoint, each error code, each log line exists for a reason that traces back to "the agent needs this to do its job."
+
+### `/src/lib` — The brains of the API
+
+This is where the business logic lives. These files don't know about HTTP or React — they just do their job.
+
+**`prisma.ts`** — A singleton for the database connection. "Singleton" means there's only one instance, shared everywhere. Without this, each request would open a new database connection, and we'd run out.
+
+**`auth.ts`** — Configures NextAuth. Defines how login works, what happens after login, how sessions are stored.
+
+**`briefs.ts`** — Functions for creating and fetching briefs. `createBrief()`, `getUserBriefs()`, `getLastSuccessBrief()`. Pure logic, no HTTP.
+
+**`webhook-errors.ts`** — The `ErrorCode` enum and response helper functions. **This is the agent's vocabulary.** Defines all the ways a webhook can fail (`INVALID_JSON`, `MISSING_REQUIRED_FIELD`, etc.) and provides `createErrorResponse()` / `createSuccessResponse()` for consistent formatting.
+
+**`webhook-validation.ts`** — Payload schema validation. Defines what a valid webhook payload looks like (required: `title`, `content`; optional: `source`, `timestamp`) and validates incoming data against it. The validation layer is what produces the structured errors the agent branches on.
+
+**`request-utils.ts`** — Utilities for safely reading request bodies and extracting metadata for logging. The `webhook_failed` event captures full context (truncated rawBody + whitelisted headers), which is what the debug endpoint hands to the agent:
+
+- `truncate(str, maxLen)` — Safely truncate strings (used for rawBody in failure logs)
+- `pickHeaders(headers)` — Extract only whitelisted headers (content-type, user-agent, x-flowbrief-signature, x-forwarded-for)
+- `safeReadBody(request)` — Read request body once without throwing (returns null on failure)
+- `extractRequestMeta(request, rawBody)` — Build metadata object for `webhook_received` events
+- `buildFailureProperties(...)` — Build full context for `webhook_failed` events
+
+**`events.ts`** — Analytics/logging. Every webhook received, every brief generated — we log it. The agent reads this log via `/api/activation-debug`.
+
+**`ai.ts`** — The AI integration (currently unused in the ingest path, but available for future features). Has a graceful fallback pattern if OpenAI isn't configured.
+
+### `/src/app/api` — The endpoints
+
+**`/api/ingest/[userId]/route.ts`** — The webhook the user's automations point at. **This is the endpoint whose failures the agent rescues from.** The `[userId]` is a dynamic segment — the URL `/api/ingest/abc123` will receive `userId = "abc123"` as a parameter.
+
+This endpoint implements a strict validation pipeline:
+
+1. **Method check** — Only POST allowed (returns `INVALID_METHOD` for GET/PUT/DELETE/PATCH)
+2. **User check** — userId must exist in database (returns `USER_NOT_FOUND` 404). Done early so all logging uses a FK-safe userId.
+3. **Content-Type check** — Must be `application/json` (returns `UNSUPPORTED_CONTENT_TYPE`)
+4. **Size check** — Max 20KB via header AND body (returns `PAYLOAD_TOO_LARGE`)
+5. **JSON parse** — Body must be valid JSON (returns `INVALID_JSON`)
+6. **Schema validation** — Must have `title` and `content` fields (returns `MISSING_REQUIRED_FIELD` or `INVALID_FIELD_TYPE`)
+7. **Logging** — Every request logs `webhook_received`; failures also log `webhook_failed` with error details. Unknown users get `userId: null` with `attemptedUserId` in properties.
+8. **Save** — Valid payloads are stored as Briefs
+9. **Return** — `{ ok: true }` on success, `{ ok: false, errorCode, errorDetails }` on failure
+
+**`/api/activation-status/route.ts`** — The simple yes/no check. "Has this user successfully sent at least one valid webhook?" Public endpoint; used by the dashboard ("Set up your webhook!" vs "You're all set!") and by Workflow 1's basic SLA check.
+
+**`/api/activation-debug/route.ts`** — **The agent's eyes.** A token-protected endpoint for n8n to fetch detailed debug context when activation fails. Requires `x-internal-token` header matching `INTERNAL_API_TOKEN` env var. Returns:
+
+- `activated`: whether user has at least one SUCCESS brief
+- `lastAttemptAt`: most recent webhook attempt
+- `lastFailure`: full context of most recent `webhook_failed` event (errorCode, errorDetails, rawBody, headers)
+- `recentFailures`: last 5 failures with timestamps and error codes
+- `lastReceived`: most recent `webhook_received` event metadata
+
+Two endpoints, two audiences: the public status endpoint serves the dashboard and the simple workflow; the protected debug endpoint serves the agent. The split exists because public callers shouldn't be able to inspect failure details for arbitrary userIds.
+
+**`/api/test-payload/route.ts`** — Calls the ingest endpoint with fake data. Great for testing without setting up n8n.
+
+### Why the `errorCode` taxonomy exists
+
+When we first built the webhook endpoint, errors looked like this:
+
+```json
+{ "ok": false, "error": "Invalid JSON payload" }
+```
+
+Simple, human-readable... and useless for automation. If an n8n workflow received this, what could it do? Log it and give up? Send a generic alert?
+
+We needed **structured errors** — a vocabulary that both humans and machines understand. So we created an `ErrorCode` enum:
+
+```typescript
+export enum ErrorCode {
+  INVALID_JSON = "INVALID_JSON",
+  UNSUPPORTED_CONTENT_TYPE = "UNSUPPORTED_CONTENT_TYPE",
+  MISSING_REQUIRED_FIELD = "MISSING_REQUIRED_FIELD",
+  INVALID_FIELD_TYPE = "INVALID_FIELD_TYPE",
+  PAYLOAD_TOO_LARGE = "PAYLOAD_TOO_LARGE",
+  INVALID_METHOD = "INVALID_METHOD",
+  UNAUTHORIZED = "UNAUTHORIZED",
+  USER_NOT_FOUND = "USER_NOT_FOUND",
+}
+```
+
+Now the agent can do this:
+
+```
+IF errorCode == "MISSING_REQUIRED_FIELD" → tell GPT: "the user forgot a field"
+IF errorCode == "INVALID_JSON"           → tell GPT: "the user's body wasn't valid JSON"
+IF errorCode == "UNSUPPORTED_CONTENT_TYPE" → tell GPT: "the user sent the wrong Content-Type"
+```
+
+And `errorDetails` provides context without breaking the contract:
+
+```json
+{
+  "ok": false,
+  "errorCode": "MISSING_REQUIRED_FIELD",
+  "errorDetails": {
+    "field": "title",
+    "message": "Required field 'title' is missing"
+  }
+}
+```
+
+The agent feeds this directly into its Switch node. Each branch sets a per-error fix hint, which then goes into the LLM prompt as already-digested context. The LLM doesn't have to figure out *what* went wrong — it just has to write a friendly email about it.
+
+### The Payload Schema: Required vs Optional
+
+A minimal schema for webhook payloads:
+
+```typescript
+interface WebhookPayload {
+  title: string;      // Required: What is this about?
+  content: string;    // Required: The actual data/message
+  source?: string;    // Optional: Where did this come from?
+  timestamp?: string; // Optional: When did it happen? (ISO 8601)
+}
+```
+
+Why these fields?
+
+- **`title`** — Every brief needs a headline. This becomes the `summaryText` in the database.
+- **`content`** — The actual information. Up to 20KB.
+- **`source`** — Useful for filtering/grouping ("Stripe? Calendar? Form?")
+- **`timestamp`** — When the event *actually* happened, not when we received it. Important for audit trails.
+
+The timestamp validation is strict — it must be a valid ISO 8601 string (`2026-02-02T15:30:00.000Z`). No loose date parsing, no timezone ambiguity.
+
+### Payload Size Limits: Defense in Depth
+
+The ingest endpoint checks payload size twice (limit: 20KB):
+
+```typescript
+const MAX_PAYLOAD_SIZE = 20 * 1024;
+
+// First check: Content-Length header (fast, before reading body)
+const contentLength = request.headers.get("content-length");
+if (contentLength && parseInt(contentLength) > MAX_PAYLOAD_SIZE) { ... }
+
+// Second check: Actual body length (after reading)
+if (rawBody.length > MAX_PAYLOAD_SIZE) { ... }
+```
+
+Why both? The `Content-Length` header can be spoofed or missing. A malicious request could say "I'm 100 bytes" but send 100MB. The header check is fast (doesn't read the body), but we verify after reading too.
+
+20KB is enough for any reasonable webhook payload (a Stripe event is ~2KB, a form submission ~1KB), but small enough to prevent abuse.
+
+### Dual Logging: Received vs Failed
+
+The ingest endpoint logs two different events:
+
+```typescript
+// Always logged (even for invalid requests)
+await logEvent({ userId, eventName: "webhook_received", ... });
+
+// Only logged when validation fails
+await logEvent({ userId, eventName: "webhook_failed", ... });
+```
+
+- **`webhook_received`** answers: "Did the request reach us?" Useful for debugging network issues.
+- **`webhook_failed`** answers: "Why did it fail?" Contains errorCode, details, raw body (truncated to 20KB), and whitelisted headers.
+
+The `webhook_failed` event captures the full request context — exactly what the agent's debug endpoint serves up. This means when the rescue workflow checks why activation failed, it has everything it needs to diagnose the problem without asking the user to reproduce it.
+
+### The dashboard: a thin window into the data
+
+The user-facing UI is intentionally simple — it's not the product, the agent is. The dashboard serves as a sanity-check view for the user: "did my webhook arrive? are my briefs being stored?"
+
+**`page.tsx`** — A server component that fetches briefs and renders the dashboard. It imports all the client components (buttons, lists) and passes them data.
+
+**`briefs-list.tsx`** — Renders a list of briefs with their status, summary, and action items.
+
+**`webhook-url.tsx`** — Displays your personal webhook URL with a copy button.
+
+**`test-payload-button.tsx`** — Calls `/api/test-payload` to trigger a test brief.
+
+**`sign-out-button.tsx`** — A client component (needs `"use client"` because it uses `onClick`).
+
+#### The Pattern: Server Components + Client Components
+
+Notice how `page.tsx` doesn't have `"use client"` at the top? It's a **server component**. It can:
+
+- Be `async`
+- Fetch data directly with `await`
+- Access the database
+- Use secrets (environment variables)
+
+But it can NOT:
+
+- Use `useState` or `useEffect`
+- Handle click events
+- Use browser APIs
+
+For interactivity, we create **client components** (marked with `"use client"`). The server component renders them and passes data as props.
+
+```tsx
+// Server component
+export default async function DashboardPage() {
+  const briefs = await getUserBriefs(userId);  // runs on server
+  return <BriefsList briefs={briefs} />;       // passes data to client
+}
+
+// Client component
+"use client";
+export function BriefsList({ briefs }) {
+  // Can use useState, onClick, etc. here
+}
+```
+
+The server does the heavy lifting, the client handles interactivity. Best of both worlds.
+
+---
+
+## Lessons Learned
+
+The biggest lesson is at the top because everything else flows from it.
+
+### Build Agents as Pipelines, Not as Black Boxes
+
+This is the biggest takeaway from the entire project.
+
+The seductive thing about LLMs is that they can do *anything*. So when you build an "AI agent," the temptation is to point a giant prompt at the model and let it figure things out — which user, which error, which response, all in one shot.
+
+That works in demos. In production, it's a debugging nightmare. When the output is wrong, you can't tell which part of the reasoning broke. When you need to handle a new edge case, you can't tell whether to reprompt or restructure. The LLM's opacity becomes *your* opacity.
+
+**The fix is to constrain the LLM to one well-scoped job.** In our rescue workflow:
+
+- The webhook receipt is plain HTTP — no LLM.
+- Pulling the user's debug context is a structured API call — no LLM.
+- Branching on the known `errorCode` is a Switch node — no LLM.
+- Posting to Slack is a Slack node — no LLM.
+- Re-checking activation is plain HTTP — no LLM.
+
+The LLM is invoked once, at one step, with structured input (user info + error type + raw failed request) and a structured output contract (JSON with `diagnosis`, `fixSteps`, `email.subject`, `email.body`). It does the one thing it's uniquely good at: turning that structured input into natural-language text addressed to a specific human.
+
+Everything else is plumbing — and plumbing is *fixable* in a way that "the LLM did something weird" isn't.
+
+**Lesson:** Treat the LLM like a function in your pipeline, not like a brain you delegate to. Wrap it tightly: structured input, structured output, validation on both sides, and as little context as the job actually requires. The agent's intelligence comes from the pipeline's *shape*, not from the LLM doing more.
+
+### Speak Your Consumer's Language: Codes for Machines, Strings for Humans
+
+When building APIs that automation systems will consume, think about the *consumer* of your errors. A friendly string like "Invalid JSON payload" is fine for humans reading logs, but useless for an automated workflow trying to decide what to do.
+
+The agent reads `errorCode`. The user (eventually) reads the LLM-generated email. Both audiences are served — but only because we maintained separate channels: machine-readable codes + human-readable details, both in the same response.
+
+**Lesson:** When building APIs for automation, you need both. Strings are for humans. Codes are for machines. Both, always.
+
+### The Foreign Key Crash: USER_NOT_FOUND
+
+*Added: February 3, 2026*
+
+A real "oh no" moment. We discovered that hitting `/api/ingest/fake-user-id` with a userId that doesn't exist would crash with a Prisma error:
+
+```
+P2003: Foreign key constraint violated on the field `Event_userId_fkey`
+```
+
+**What happened:** Our `Event` table has a foreign key from `Event.userId` to `User.id`. The ingest route was calling `logEvent({ userId: "fake-user-id", ... })` *before* checking if the user exists — and Prisma rightfully refused to insert an Event pointing to a non-existent User.
+
+It's like trying to file a document in a cabinet drawer that doesn't exist. The database said "nope."
+
+**The fix was about ordering and nullability:**
+
+1. **Move the user check to the top.** Before logging anything, check if the user exists.
+2. **Compute a "safe" userId:** If user exists, use their real id. If not, use `undefined` (which Prisma stores as `null`).
+3. **Stash the attempted id in properties:** So we don't lose the forensic trail — the `attemptedUserId` is preserved in the event's JSON.
+
+```typescript
+const user = await prisma.user.findUnique({ where: { id: paramUserId } });
+const safeUserId = user ? paramUserId : undefined;
+
+// Now safe to log — userId is either valid or null
+await logWebhookReceived(safeUserId, paramUserId, request, rawBody);
+```
+
+We also added `USER_NOT_FOUND` as a proper error code (with HTTP 404) instead of the previous `UNAUTHORIZED` (401). "Unauthorized" implies bad credentials; "User not found" is the accurate diagnosis.
+
+**Lesson:** When your database has foreign keys, validate references *before* inserting. Easy to miss when the "insert" is buried inside a helper function (like `logEvent`). Validate first, log safely, then fail with a clear message.
+
+### SQLite + JSON: The Stringify Dance
+
+SQLite doesn't have a native JSON column type. So we store JSON as strings:
+
+```typescript
+// Saving
+inputJson: JSON.stringify(payload)
+
+// Reading
+JSON.parse(brief.inputJson)
+```
+
+It's slightly annoying, but it works. The pitfall: forget to parse and you'll get `"[object Object]"` everywhere.
+
+**Lesson:** When using SQLite with JSON data, create helper functions that handle the conversion, so you don't have to remember every time.
+
+### NextAuth v5 Session Quirk
+
+By default, NextAuth uses database sessions. But with credentials auth (email/password), we need **JWT sessions**. Why? Database sessions require a session token stored in a cookie AND the database. JWTs are self-contained — the session lives entirely in the cookie.
+
+```typescript
+export const { auth } = NextAuth({
+  session: { strategy: "jwt" },  // <-- This line is crucial
+  // ...
+});
+```
+
+Without this, you'll get cryptic errors about missing session tokens.
+
+### The Graceful Fallback Pattern
+
+Look at `ai.ts`:
+
+```typescript
+export async function generateBrief(inputJson: unknown): Promise<BriefResult> {
+  const openaiKey = process.env.OPENAI_API_KEY;
+
+  if (openaiKey) {
+    return generateWithOpenAI(inputJson, openaiKey);
+  }
+
+  return generateFallback(inputJson);  // Works without API key!
+}
+```
+
+This is a **graceful degradation** pattern. The app doesn't break if OpenAI isn't configured — it just does something simpler. Benefits:
+
+- New developers can run the project immediately (no API key signup required)
+- If OpenAI goes down, the app still works
+- Tests don't need mocked API responses
+
+**Lesson:** Always ask "What if this dependency fails?" and have a fallback plan.
+
+---
+
+## How Good Engineers Think
+
+### Start Simple, Add Complexity Only When Needed
+
+FlowBrief started as:
+
+1. An endpoint that receives JSON
+2. A database to store it
+3. A page to display it
+
+No AI summarization at first. No auth. No event tracking. **No agent.** Each feature was added when there was a clear need. This is **YAGNI** — "You Aren't Gonna Need It." Build what you need today.
+
+The agent was the last thing built — only after the API was stable, the error codes were structured, and the debug endpoint existed. The agent piggybacked on a substrate that was already solid. If you try to build the agent first, you have nothing to feed it.
+
+### Separation of Concerns
+
+`/lib/briefs.ts` doesn't know about HTTP. It just has functions like `createBrief(data)`. The API route calls these functions and handles the HTTP stuff (status codes, headers, JSON responses).
+
+This same pattern shows up at the architecture level: the agent doesn't know about Prisma. It calls `/api/activation-debug` and gets back JSON. The HTTP layer is the seam. Either side can be replaced without disturbing the other.
+
+### Fail Fast, Fail Loudly
+
+The ingest endpoint's validation:
+
+```typescript
+if (!contentType.includes("application/json")) {
+  return NextResponse.json(
+    createErrorResponse(ErrorCode.UNSUPPORTED_CONTENT_TYPE, {
+      expected: "application/json",
+      received: contentType || "none",
+    }),
+    { status: 415 }
+  );
+}
+```
+
+It doesn't try to "be helpful" and guess the content type. If something's wrong, it fails immediately with a structured error.
+
+This is crucial for automation. The agent can branch on `errorCode` and take different actions for different failure types. A human-readable error message is nice; a machine-readable error code is essential for building reliable integrations.
+
+---
+
+## What's Next?
+
+### Completed
+
+- [x] **Error taxonomy + payload validation** — Structured error codes, required payload schema, machine-readable failure signals
+- [x] **Dual webhook logging** — Every request logs `webhook_received` with metadata; failures also log `webhook_failed` with full context (errorCode, rawBody, headers)
+- [x] **Activation debug endpoint** — Token-protected `/api/activation-debug` endpoint for n8n to fetch diagnostic context
+- [x] **USER_NOT_FOUND fix** — Unknown userId no longer crashes with Prisma FK violation; returns clean 404, logs events with `userId: null` + `attemptedUserId` in properties
+- [x] **OpenAI credential configured + AI rescue loop tested end-to-end** — Workflow 2 is Published in n8n and running successfully
+- [x] **Published to GitHub** — Repo at https://github.com/djianp/flowbrief; README rewritten to lead with the n8n agent story, FlowBrief framed as the substrate
+
+### Backlog
+
+- [ ] Move Wait-node duration into a workflow variable (so dev/prod toggle isn't a manual edit)
+- [ ] Add webhook authentication (so only n8n can call the ingest endpoint)
+- [ ] Add more error code cases to the Switch node as we discover them
+- [ ] Multiple AI providers (Claude, Gemini, local models)
+- [ ] Email notifications when briefs are generated
+
+---
+
+## Appendix: Synta MCP Tools Reference
 
 These are the n8n management tools available via MCP:
 
@@ -757,24 +801,4 @@ These are the n8n management tools available via MCP:
 
 ---
 
-## What's Next?
-
-*This section tracks upcoming work and ideas...*
-
-### Completed
-- [x] **Error taxonomy + payload validation** — Structured error codes, required payload schema, machine-readable failure signals
-- [x] **Dual webhook logging** — Every request logs `webhook_received` with metadata; failures also log `webhook_failed` with full context (errorCode, rawBody, headers)
-- [x] **Activation debug endpoint** — Token-protected `/api/activation-debug` endpoint for n8n to fetch diagnostic context
-- [x] **USER\_NOT\_FOUND fix** — Unknown userId no longer crashes with Prisma FK violation; returns clean 404, logs events with `userId: null` + `attemptedUserId` in properties
-- [x] **OpenAI credential configured + AI rescue loop tested end-to-end** — Workflow 2 is Published in n8n and running successfully
-- [x] **Published to GitHub** — Repo at https://github.com/djianp/flowbrief; README rewritten to lead with the n8n agent story, FlowBrief framed as the substrate
-
-### Backlog
-- [ ] Add webhook authentication (so only n8n can call the endpoint)
-- [ ] Email notifications when briefs are generated
-- [ ] Multiple AI providers (Claude, Gemini, local models)
-- [ ] Add more error code cases to Switch node as we discover them
-
----
-
-*Last updated: May 2, 2026 at 13:18 CET — Expanded n8n/agent coverage: added "Why n8n? Why Synta MCP? Why activation rescue?" intro, "Designing the AI Rescue Agent: Deterministic-then-LLM" subsection with design rationale, pitfalls section, and "Build Agents as Pipelines" lesson*
+*Last updated: May 2, 2026 at 13:30 CET — Wholesale rewrite to put the AI rescue agent at the center. The agent is now the headline; FlowBrief (the Next.js app) is framed as the substrate the agent operates on. Reorganized: agent stack and design rationale come before the API; API sections explain themselves as "what the agent reads"; lessons learned now leads with "Build Agents as Pipelines."*
