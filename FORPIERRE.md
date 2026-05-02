@@ -445,6 +445,30 @@ We also added `USER_NOT_FOUND` as a proper error code (with HTTP 404) instead of
 
 **Lesson:** When your database has foreign keys, you need to validate references *before* inserting. This sounds obvious in hindsight, but it's easy to miss when the "insert" is buried inside a helper function (like `logEvent`). Think about the order of operations: validate first, log safely, then fail with a clear message.
 
+### Build Agents as Pipelines, Not as Black Boxes
+
+*Added: May 2, 2026*
+
+This one is the biggest takeaway from building the rescue workflow, and it's worth pulling out from the n8n section because it generalizes.
+
+The seductive thing about LLMs is that they can do *anything*. So when you build an "AI agent," the temptation is to point a giant prompt at the model and let it figure things out — which user, which error, which response, all in one shot.
+
+That works in demos. In production, it's a debugging nightmare. When the output is wrong, you can't tell which part of the reasoning broke. When you need to handle a new edge case, you can't tell whether to reprompt or restructure. The LLM's opacity becomes *your* opacity.
+
+**The fix is to constrain the LLM to one well-scoped job.** In our rescue workflow:
+
+- The webhook receipt is plain HTTP — no LLM.
+- Pulling the user's debug context is a structured API call — no LLM.
+- Branching on the known `errorCode` is a Switch node — no LLM.
+- Posting to Slack is a Slack node — no LLM.
+- Re-checking activation is plain HTTP — no LLM.
+
+The LLM is invoked once, at one step, with structured input (user info + error type + raw failed request) and a structured output contract (JSON with `diagnosis`, `fixSteps`, `email.subject`, `email.body`). It does the one thing it's uniquely good at: turning that structured input into natural-language text addressed to a specific human.
+
+Everything else is plumbing — and plumbing is *fixable* in a way that "the LLM did something weird" isn't.
+
+**Lesson:** Treat the LLM like a function in your pipeline, not like a brain you delegate to. Wrap it tightly: structured input, structured output, validation on both sides, and as little context as the job actually requires. The agent's intelligence comes from the pipeline's *shape*, not from the LLM doing more.
+
 ---
 
 ## How Good Engineers Think
@@ -498,7 +522,45 @@ This is crucial for automation. n8n workflows can now branch on `errorCode` and 
 
 *Added: February 2, 2026*
 
-We're using **Synta MCP** to manage n8n workflows directly from Claude Code. This gives us programmatic control over workflow creation, validation, and management without touching the n8n UI.
+The n8n workflows aren't a side-project — they're the **point** of FlowBrief. The Next.js app is just the substrate the agent operates on. So this section is the most important part of the journal.
+
+### Why n8n?
+
+Could we have written all of this as plain Node scripts on a cron? Technically yes. We didn't, for three reasons:
+
+**1. Visual debugging beats logs.** When a workflow fails, n8n shows you exactly which node failed, what its input was, and what its output (or error) was. You don't have to grep logs to figure out "did the OpenAI call timeout, or did the JSON parse choke?" — you can see it.
+
+**2. Built-in nodes for the boring stuff.** Webhook receivers, Wait nodes, Slack messages, OpenAI calls, HTTP requests with retry/auth handling — all out of the box. We're not writing OAuth flows for Slack or rate-limit handlers for OpenAI.
+
+**3. Webhooks are first-class.** Every n8n workflow can expose its own webhook URL. The "paid conversion" workflow listens at `/webhook/paid-conversion`; the rescue workflow listens at `/webhook/flowbrief/new-user`. No reverse proxy config, no Express boilerplate.
+
+The trade-off: n8n workflows are stored as JSON in n8n's database, not in Git. They're harder to version-control and harder to test in isolation. For a high-stakes pipeline you'd want both. For an activation-rescue agent, the velocity gain is worth it.
+
+### Why Synta MCP?
+
+Without it, the workflow lives in n8n's UI. You build it by clicking nodes together, which is fast for the first version but painful for iteration — every change is a manual UI action, and there's no diff.
+
+With Synta MCP, Claude Code can:
+- Read the workflow's JSON definition (`n8n_get_workflow`)
+- Add or remove nodes incrementally (`n8n_update_partial_workflow`)
+- Validate before deploying (`n8n_validate_workflow`)
+- Auto-fix common config issues (`n8n_autofix_workflow`)
+
+Effectively it turns the n8n workflow into something we can edit like code, in a conversation. The agent's design lives in this journal and in the Synta MCP commands we ran — not just in clicked-together state hidden in n8n.
+
+### Why activation rescue specifically?
+
+A bit of SaaS-funnel context, because this is the actual product insight:
+
+**Activation** is the moment a user does the first key thing your product is supposed to do. For FlowBrief, that's sending their first valid webhook. Until that happens, nothing useful has occurred — they signed up, they paid, they... bounced off your getting-started docs.
+
+The activation gap (signup → first success) is where the majority of SaaS churn happens. A user who completes activation in their first session retains dramatically better than one who comes back the next day to "try again later" (they don't).
+
+**The traditional rescue:** at T+24h, send a generic "having trouble?" email. The user reads "having trouble?" and thinks "I guess?" and closes it. The email had no idea what their actual problem was.
+
+**The agent rescue:** at T+45min (or whatever the SLA is), look at *exactly* what the user tried, what error came back, what they were probably trying to do — then write them an email that names their specific failure and tells them how to fix it. The user reads "Your webhook on Feb 2 sent `Content-Type: text/plain` instead of `application/json`. Here's the fixed curl command." and thinks "oh, that's a different kind of email."
+
+That difference — generic vs. specific — is what makes the LLM step earn its keep.
 
 ### Workflow 1: Paid conversion → Activation rescue loop (FlowBrief)
 
@@ -605,6 +667,72 @@ curl -X POST "https://<n8n-instance>/webhook-test/flowbrief/new-user" \
 
 ---
 
+---
+
+### Designing the AI Rescue Agent: Deterministic-then-LLM
+
+This is the most interesting design decision in the whole project, so it deserves its own section.
+
+**The naive design.** Most "AI agent" tutorials show you something like:
+
+```
+webhook → big LLM prompt with everything → action
+```
+
+The LLM gets the raw failure, the user info, the kitchen sink, and you ask it to "diagnose and respond." This *works*, but it's brittle in three ways:
+
+1. **You can't see why it failed.** When the response is wrong, was it the prompt? The model? The input? You're guessing.
+2. **You can't fast-path known cases.** Even if you already know `INVALID_JSON` means "they didn't `JSON.stringify` their payload," the LLM has to figure that out every time, costing latency and tokens.
+3. **Adding a new failure type means reprompting.** And reprompting means re-testing against every existing case to make sure you didn't regress.
+
+**Our design.** We split the workflow into three phases:
+
+```
+   Phase 1: deterministic prefix
+   ┌─────────────────────────────────────────────┐
+   │ webhook → status check → debug fetch →      │
+   │ Switch on errorCode → set per-error context │
+   └─────────────────────────────────────────────┘
+                        ↓
+   Phase 2: the one place an LLM is actually needed
+   ┌─────────────────────────────────────────────┐
+   │ OpenAI: "given this error type AND this     │
+   │ specific user's failed request, write a     │
+   │ rescue email tailored to them"              │
+   └─────────────────────────────────────────────┘
+                        ↓
+   Phase 3: deterministic suffix
+   ┌─────────────────────────────────────────────┐
+   │ parse JSON → Slack post → wait → re-check   │
+   │ activation → success/escalate branch        │
+   └─────────────────────────────────────────────┘
+```
+
+The LLM only does what only an LLM can do: turn structured failure data into natural-language text addressed to a specific human. Everything else is plain logic.
+
+**Why this is better:**
+
+- **Each step is observable.** If the OpenAI node returns garbage, you see it in n8n's execution view. You don't have to reason about a 2000-token blob.
+- **Adding a new error type is cheap.** Add a Switch branch with the error-specific fix hint. The LLM prompt doesn't change — it already takes "fix hint" as input.
+- **The LLM prompt is small.** It only has to do *one* job (synthesize email), with pre-digested context (already-known error type, already-extracted user info). Smaller prompts = more reliable outputs.
+- **You can test it without an LLM.** The deterministic phases can be exercised with curl and assertions. The LLM phase you test by sampling.
+
+**The design rule (worth stealing):**
+
+> Put the LLM where structured-to-natural-language translation actually happens. Everything before that should be deterministic. Everything after that should validate and act.
+
+This is the inverse of how most "agent" demos look, where the LLM is the centerpiece and everything is plumbing. Here the LLM is the plumbing — the centerpiece is the pipeline.
+
+### Pitfalls we hit (and you will too)
+
+**LLM JSON parsing is fragile.** Even with `response_format: json_object`, models sometimes prefix output with "Here's the JSON:" or wrap it in ```json fences. The "Parse AI JSON" node strips those before parsing, and fails fast (with a useful error) if parsing breaks. Don't try to recover from malformed LLM JSON — surface it.
+
+**Wait nodes have no env-aware mode.** The two `Wait` nodes are set to 30 seconds for testing; production wants 45 minutes. Right now switching between them is a manual edit. The right long-term fix is to read the duration from a workflow variable. The quick-and-dirty fix (which we're using) is documenting it in the workflow description and in this file.
+
+**Slack messages are the audit log.** Every branch — success, partial-success, hard-fail, AI-error — ends in a Slack post. The Slack channel becomes the searchable, persistent record of what the agent did. This is much cheaper than wiring up a real monitoring stack for low-volume internal automation.
+
+---
+
 ### Synta MCP Tools Reference
 
 These are the n8n management tools available via MCP:
@@ -649,4 +777,4 @@ These are the n8n management tools available via MCP:
 
 ---
 
-*Last updated: May 2, 2026 at 13:11 CET — Marked Workflow 2 as Active, OpenAI credential as Configured; checked off the rescue-loop E2E test; added GitHub publish to Completed*
+*Last updated: May 2, 2026 at 13:18 CET — Expanded n8n/agent coverage: added "Why n8n? Why Synta MCP? Why activation rescue?" intro, "Designing the AI Rescue Agent: Deterministic-then-LLM" subsection with design rationale, pitfalls section, and "Build Agents as Pipelines" lesson*
