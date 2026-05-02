@@ -94,7 +94,7 @@ Both workflows live in n8n (managed via the [Synta MCP](https://github.com/synta
 | Workflow | ID | Status | Webhook path |
 | --- | --- | --- | --- |
 | **Paid conversion → Activation rescue (simple)** | `Xs7MPdACbBYwXruW` | Active | `/webhook/paid-conversion` |
-| **Activation SLA + AI Rescue Loop** | `CJY7NTNz0UCzYxG4` | Inactive (needs OpenAI cred) | `/webhook/flowbrief/new-user` |
+| **Activation SLA + AI Rescue Loop** | `CJY7NTNz0UCzYxG4` | Active | `/webhook/flowbrief/new-user` |
 
 The first is a minimal SLA monitor — Slack ping at signup, Slack ping at the deadline saying activated/not. The second is the full agent described above. See [`FORPIERRE.md`](./FORPIERRE.md) for the full story behind both.
 
