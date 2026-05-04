@@ -13,6 +13,13 @@ export async function POST(request: Request) {
       );
     }
 
+    if (typeof password !== "string" || password.length < 8 || password.length > 72) {
+      return NextResponse.json(
+        { error: "Password must be between 8 and 72 characters" },
+        { status: 400 }
+      );
+    }
+
     const existingUser = await prisma.user.findUnique({
       where: { email },
     });

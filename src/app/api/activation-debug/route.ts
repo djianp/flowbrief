@@ -1,5 +1,14 @@
 import { NextRequest, NextResponse } from "next/server";
+import { timingSafeEqual } from "crypto";
 import { prisma } from "@/lib/prisma";
+
+function tokensMatch(provided: string | null, expected: string): boolean {
+  if (!provided) return false;
+  const a = Buffer.from(provided);
+  const b = Buffer.from(expected);
+  if (a.length !== b.length) return false;
+  return timingSafeEqual(a, b);
+}
 
 /**
  * Safely parse JSON string, returning empty object on failure
@@ -17,7 +26,7 @@ export async function GET(request: NextRequest) {
   const token = request.headers.get("x-internal-token");
   const expectedToken = process.env.INTERNAL_API_TOKEN;
 
-  if (!expectedToken || token !== expectedToken) {
+  if (!expectedToken || !tokensMatch(token, expectedToken)) {
     return NextResponse.json(
       { ok: false, error: "UNAUTHORIZED" },
       { status: 401 }
