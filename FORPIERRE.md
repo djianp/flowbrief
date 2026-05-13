@@ -712,6 +712,38 @@ This is a **graceful degradation** pattern. The app doesn't break if OpenAI isn'
 
 **Lesson:** Always ask "What if this dependency fails?" and have a fallback plan.
 
+### The npm Audit Trap: When the Cure Is Worse Than the Disease
+
+*Added: May 13, 2026*
+
+A real "wait, what?" moment that nearly broke the app.
+
+We had a legitimate batch of 18 high-severity Next.js CVEs to patch — HTTP request smuggling, middleware bypass, SSRF, several DoS variants. The kind of thing that actually matters for a webhook-receiving app. `npm audit fix --force` did the right thing: bumped Next from 16.1.6 → 16.2.6. Clean build, dev server happy.
+
+Then we ran `npm audit` again, saw a remaining moderate severity on `postcss`, and almost ran `npm audit fix --force` a second time.
+
+**What we caught just in time.** The proposed fix was: *"Will install next@9.3.3, which is a breaking change."* npm wanted to downgrade Next from 16.2.6 all the way back to **9.3.3** — a 2020 release — to satisfy a postcss vulnerability that lives inside Next's own bundled dependencies. The entire app would have stopped working. App Router doesn't exist in Next 9. React Server Components don't exist. Half the imports break.
+
+**Why does npm propose this?** Because `npm audit fix` is a constraint solver, not a senior engineer. It sees: "find a version of `next` whose transitive `postcss` is ≥ 8.5.10." It searches the version graph. It happens to find that `next@9.3.3` satisfies the constraint, declares victory, and proposes the change. It doesn't know that going from 16 → 9 is catastrophic; it just knows that this satisfies the constraint.
+
+**The escape hatch (if you ever need it).** If you want to silence a transitive vulnerability without touching the parent package, npm supports an `overrides` field:
+
+```json
+"overrides": {
+  "postcss": "^8.5.10"
+}
+```
+
+This tells npm "regardless of what `next` claims to need internally, install postcss ≥ 8.5.10 throughout the tree." It bypasses the constraint solver and just imposes the answer. We didn't use this here because the remaining postcss CVE is XSS in CSS stringification output — exploitable only if you stringify untrusted CSS and embed it in HTML. A backend that receives JSON webhooks and serves Tailwind-precompiled CSS has zero exposure. We left the warning standing.
+
+**Lesson:** `npm audit` is a *signal*, not an instruction. Three rules to bake in:
+
+1. **Read the proposed version number, not just the severity tag.** A "breaking change" that downgrades a major version is almost never the right answer.
+2. **Triage transitive warnings against your usage.** CVE severity is computed for the general case across all users of a package; whether it applies to *your* app depends on what you actually do with that dep.
+3. **Use `overrides` when you need to fix a transitive without touching the parent.** That's exactly what the feature exists for.
+
+Chasing every audit warning to zero is a great way to break working code. Reading audit output carefully — and accepting some yellow flags as "doesn't apply" — is what experienced engineers do.
+
 ---
 
 ## How Good Engineers Think
@@ -763,9 +795,10 @@ This is crucial for automation. The agent can branch on `errorCode` and take dif
 - [x] **Error taxonomy + payload validation** — Structured error codes, required payload schema, machine-readable failure signals
 - [x] **Dual webhook logging** — Every request logs `webhook_received` with metadata; failures also log `webhook_failed` with full context (errorCode, rawBody, headers)
 - [x] **Activation debug endpoint** — Token-protected `/api/activation-debug` endpoint for n8n to fetch diagnostic context
-- [x] **USER_NOT_FOUND fix** — Unknown userId no longer crashes with Prisma FK violation; returns clean 404, logs events with `userId: null` + `attemptedUserId` in properties
+- [x] **USER\_NOT\_FOUND fix** — Unknown userId no longer crashes with Prisma FK violation; returns clean 404, logs events with `userId: null` + `attemptedUserId` in properties
 - [x] **OpenAI credential configured + AI rescue loop tested end-to-end** — Workflow 2 is Published in n8n and running successfully
 - [x] **Published to GitHub** — Repo at https://github.com/djianp/flowbrief; README rewritten to lead with the n8n agent story, FlowBrief framed as the substrate
+- [x] **Next.js security upgrade (16.1.6 → 16.2.6)** — Patched an 18-CVE bundle (HTTP request smuggling, middleware bypass, SSRF, several DoS variants); dodged the npm audit trap that would have downgraded Next to 9.3.3 to silence a transitive postcss warning
 
 ### Backlog
 
@@ -801,4 +834,4 @@ These are the n8n management tools available via MCP:
 
 ---
 
-*Last updated: May 2, 2026 at 13:30 CET — Wholesale rewrite to put the AI rescue agent at the center. The agent is now the headline; FlowBrief (the Next.js app) is framed as the substrate the agent operates on. Reorganized: agent stack and design rationale come before the API; API sections explain themselves as "what the agent reads"; lessons learned now leads with "Build Agents as Pipelines."*
+*Last updated: May 13, 2026 at 12:05 CET — Added "The npm Audit Trap" lesson covering the Next.js 16.1.6 → 16.2.6 security upgrade and the audit-fix gotcha that nearly downgraded Next seven majors to silence a transitive postcss warning.*

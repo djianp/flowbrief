@@ -78,3 +78,7 @@ Style guidelines:
 - Make it engaging to read, not boring technical documentation
 - Use analogies and anecdotes to make concepts understandable and memorable
 - Keep updating this file as the project evolves
+
+### Dependency upgrades
+
+When running `npm audit fix --force`, always read the *proposed version number* before executing. The tool will happily propose major-version downgrades to silence transitive vulnerabilities — at one point it wanted to drop Next.js from 16.2.6 to 9.3.3 to fix a `postcss` warning, which would have destroyed the app. Treat audit warnings as signals to triage, not as instructions to apply blindly. For transitive CVEs that don't apply to this app's actual usage, either leave them standing or pin a fix via the `overrides` field in `package.json`.

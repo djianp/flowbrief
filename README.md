@@ -96,7 +96,7 @@ Both workflows live in n8n (managed via the [Synta MCP](https://github.com/synta
 | **Paid conversion → Activation rescue (simple)** | `Xs7MPdACbBYwXruW` | Active | `/webhook/paid-conversion` |
 | **Activation SLA + AI Rescue Loop** | `CJY7NTNz0UCzYxG4` | Active | `/webhook/flowbrief/new-user` |
 
-The first is a minimal SLA monitor — Slack ping at signup, Slack ping at the deadline saying activated/not. The second is the full agent described above. See [`FORPIERRE.md`](./FORPIERRE.md) for the full story behind both.
+The first is a minimal SLA monitor — Slack ping at signup, Slack ping at the deadline saying activated/not. The second is the full agent described above. See [FORPIERRE.md](./FORPIERRE.md) for the full story behind both.
 
 **Trigger the agent (test):**
 
@@ -194,5 +194,5 @@ OPENAI_API_KEY="sk-..."    # optional; the agent uses its own n8n credential
 
 ## Further reading
 
-- [`FORPIERRE.md`](./FORPIERRE.md) — full design notes, architecture decisions, and bug post-mortems (the activation FK crash, the error-taxonomy refactor, the dual-logging design)
-- [`CLAUDE.md`](./CLAUDE.md) — orientation for Claude Code working in this repo
+- [FORPIERRE.md](./FORPIERRE.md) — full design notes, architecture decisions, and bug post-mortems (the activation FK crash, the error-taxonomy refactor, the dual-logging design)
+- [CLAUDE.md](./CLAUDE.md) — orientation for Claude Code working in this repo
