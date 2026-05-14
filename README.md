@@ -106,6 +106,8 @@ curl -X POST "https://<n8n-instance>/webhook-test/flowbrief/new-user" \
   -d '{"userId": "user-123", "email": "test@example.com", "plan": "pro"}'
 ```
 
+**Connecting n8n to FlowBrief.** The rescue workflow calls *back* into FlowBrief's API (`/api/activation-status`, `/api/activation-debug`). n8n is remote and FlowBrief runs locally in development, so it can't reach `localhost` — expose FlowBrief with a tunnel (e.g. ngrok) and set the workflow's `flowbriefBaseUrl` to the tunnel URL. This is the quick way to run the loop end-to-end locally; a deployed FlowBrief would use its own public URL instead.
+
 ---
 
 ## FlowBrief (the backend)
