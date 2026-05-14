@@ -593,6 +593,45 @@ The server does the heavy lifting, the client handles interactivity. Best of bot
 
 ---
 
+## Guardrails and Evals: Making the Agent Trustworthy
+
+The agent works. But "works in a demo" and "works when a stranger is feeding it adversarial input" are different claims — and the gap between them is guardrails and evals.
+
+Here's the uncomfortable truth this project had to face: the `rawBody` the agent reads is whatever a failing webhook sent. It flows, untouched, from the ingest endpoint into a `webhook_failed` event, out through `/api/activation-debug`, into the n8n workflow, and straight into the GPT-4o prompt that drafts an email to a real customer. That's an attacker-controlled string reaching an LLM. If you don't think about that, you've built a phishing-email generator with extra steps.
+
+### The keystone move: vendoring the prompt
+
+The single most important change wasn't a guardrail — it was *moving the prompt*. The rescue prompt used to live inside an n8n node's text box. You couldn't diff it, review it, or test it. It was the most important 30 lines in the system and it was invisible to Git.
+
+Now it lives in `src/lib/rescue-prompt.ts` — the system prompt, the per-error "fix hints," the input-assembly function, and the output schema. The repo is the source of truth; the n8n workflow is *reconciled from it* (that's what `N8N-CHECKLIST.md` is for). The payoff: the eval harness imports the **exact same** `buildRescueUserPrompt` the agent runs. The thing you test and the thing you ship cannot drift apart, because they're the same code.
+
+### The guardrails
+
+Repo-side, already in place:
+
+- **Redaction at the chokepoint** (`redact.ts`, applied in `buildFailureProperties`). One function call scrubs secrets and PII — bearer tokens, API keys, emails, long digit runs — before the failure event fans out to the DB, the debug endpoint, the LLM, and Slack. One seam, four destinations covered.
+- **The frozen `errorCode` contract.** The n8n Switch node branches on `ErrorCode` string values. Rename one and the Switch silently falls through to DEFAULT — no error, just quietly worse emails. A lock test (`tests/contract/`) makes that rename fail loudly in CI instead.
+- **The human-in-the-loop invariant**, written down. The agent drafts; a human sends. It was already true; now it's recorded as an invariant in `CLAUDE.md` so a future "let's automate the send" can't quietly remove the backstop.
+
+n8n-side, specced in `N8N-CHECKLIST.md` for the operator to apply:
+
+- **Prompt-injection fencing** — wrap every user-controlled field in `<untrusted>` tags and tell the model they're inert data.
+- **Output schema validation** — check the LLM's JSON shape before acting; route malformed output to the escalate branch instead of posting garbage.
+- **Timeout + retry, a per-user rescue-call ceiling, and trigger dedup** — so a hung call, a retry storm, or a double-fired webhook can't run up cost or spam a customer.
+
+### The evals
+
+`npm run eval` is a second test layer — separate from `npm test` because it calls the real OpenAI API and costs tokens. Four suites, each importing the vendored prompt:
+
+- **golden** — does the output name the *right* failure, give fixes that address it, and stay specific? (The whole product promise is "specific, not generic.")
+- **conformance** — run each error type N times; does it *always* produce schema-valid JSON?
+- **inject** — feed it the adversarial rawBodies and confirm the injection sentinels never surface.
+- **judge** — a second model grades the draft email on specificity, correctness, tone.
+
+The shape of this is the lesson: **guardrails and evals come in pairs.** The injection fencing (guardrail) is meaningless unless the inject eval proves it holds. The schema check (guardrail) is the runtime twin of the conformance eval. A guardrail without an eval is a claim you can't verify; an eval without a guardrail is a measurement you can't act on.
+
+---
+
 ## Lessons Learned
 
 The biggest lesson is at the top because everything else flows from it.
@@ -744,6 +783,18 @@ This tells npm "regardless of what `next` claims to need internally, install pos
 
 Chasing every audit warning to zero is a great way to break working code. Reading audit output carefully — and accepting some yellow flags as "doesn't apply" — is what experienced engineers do.
 
+### The Redaction That Took 700 Milliseconds
+
+*Added: May 14, 2026*
+
+While building the PII-redaction guardrail, a test that fed a 25KB body through `redactString` took 700ms. For a regex pass over 25KB, that's absurd — and the cause was a classic.
+
+The email pattern was `[A-Za-z0-9._%+-]+@...`. The `+` says "one or more local-part characters." Feed it 25KB of letters with no `@`, and the engine greedily matches the whole run, fails to find `@`, gives back one character, fails again, gives back another... then restarts from the next position and does it all over. That's O(n²) — **catastrophic backtracking**, the engine behind a whole class of "ReDoS" denial-of-service bugs.
+
+The fix was one character of thought: `[A-Za-z0-9._%+-]{1,64}`. An email's local part is capped at 64 characters by the RFC — so the unbounded `+` was never correct in the first place. Bounding it made the regex *both* faster (backtracking is now constant per position → linear overall) *and* more correct. Test execution dropped from 1.68s to 172ms.
+
+**Lesson:** an unbounded `+` or `*` followed by a required character is a performance bug and a security bug at the same time. And it mattered here specifically: `rawBody` is attacker-controlled and truncated to 20KB before redaction — so the slow path was a cheap denial-of-service waiting for someone to send 20KB of junk. When you reach for `+`, ask what the real-world maximum is, and encode it.
+
 ---
 
 ## How Good Engineers Think
@@ -799,9 +850,11 @@ This is crucial for automation. The agent can branch on `errorCode` and take dif
 - [x] **OpenAI credential configured + AI rescue loop tested end-to-end** — Workflow 2 is Published in n8n and running successfully
 - [x] **Published to GitHub** — Repo at https://github.com/djianp/flowbrief; README rewritten to lead with the n8n agent story, FlowBrief framed as the substrate
 - [x] **Next.js security upgrade (16.1.6 → 16.2.6)** — Patched an 18-CVE bundle (HTTP request smuggling, middleware bypass, SSRF, several DoS variants); dodged the npm audit trap that would have downgraded Next to 9.3.3 to silence a transitive postcss warning
+- [x] **Test, eval, and guardrail layer** — A Vitest suite (88 tests: unit, integration against a throwaway SQLite DB, and a frozen-contract lock test); a PII/secret redaction chokepoint; the rescue prompt vendored into `src/lib/rescue-prompt.ts`; and an LLM eval harness (`npm run eval`) with golden / conformance / injection / judge suites that exercise the *exact* shipped prompt. n8n-side guardrails specced in `N8N-CHECKLIST.md`
 
 ### Backlog
 
+- [ ] Apply the n8n-side guardrails from `N8N-CHECKLIST.md` (prompt-injection fencing, output schema check, timeout/retry, per-user rescue ceiling, trigger dedup)
 - [ ] Move Wait-node duration into a workflow variable (so dev/prod toggle isn't a manual edit)
 - [ ] Add webhook authentication (so only n8n can call the ingest endpoint)
 - [ ] Add more error code cases to the Switch node as we discover them
@@ -834,4 +887,4 @@ These are the n8n management tools available via MCP:
 
 ---
 
-*Last updated: May 13, 2026 at 12:05 CET — Added "The npm Audit Trap" lesson covering the Next.js 16.1.6 → 16.2.6 security upgrade and the audit-fix gotcha that nearly downgraded Next seven majors to silence a transitive postcss warning.*
+*Last updated: May 14, 2026 at 18:48 CET — Added the test, eval, and guardrail layer: a Vitest suite, a PII/secret redaction chokepoint, the rescue prompt vendored into `src/lib/rescue-prompt.ts`, an LLM eval harness, and `N8N-CHECKLIST.md` for the n8n-side guardrails. New sections: "Guardrails and Evals" and the "Redaction That Took 700 Milliseconds" lesson.*

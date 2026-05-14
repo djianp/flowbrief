@@ -30,11 +30,16 @@ src/
 │   ├── briefs.ts            # Brief CRUD operations
 │   ├── webhook-errors.ts    # ErrorCode enum + response helpers
 │   ├── webhook-validation.ts # Payload schema validation
-│   ├── request-utils.ts     # Safe body reading + logging metadata
+│   ├── request-utils.ts     # Safe body reading + logging metadata + redaction chokepoint
+│   ├── redact.ts            # PII/secret redaction (applied in request-utils)
+│   ├── rescue-prompt.ts     # Vendored n8n rescue prompt — single source of truth
 │   ├── events.ts            # Event tracking utilities
 │   └── ai.ts                # AI/LLM integration (unused in ingest path)
 └── prisma/
     └── schema.prisma        # Database schema
+
+tests/                       # Vitest unit + integration + contract tests (npm test)
+evals/                       # LLM eval harness, hits OpenAI (npm run eval)
 ```
 
 ## Key Commands
@@ -42,9 +47,28 @@ src/
 ```bash
 npm run dev        # Start development server
 npm run build      # Build for production
+npm test           # Run the Vitest suite (offline, fast)
+npm run test:watch # Vitest in watch mode
+npm run eval       # Run the LLM eval harness (hits OpenAI — see evals/README.md)
 npm run db:push    # Push Prisma schema to database
 npm run db:studio  # Open Prisma Studio
 ```
+
+## Testing & Evals
+
+Two layers, kept deliberately separate:
+
+- **`npm test`** — Vitest. Hermetic, offline, fast. Unit tests are co-located as `src/lib/*.test.ts`; integration tests (against a throwaway SQLite DB) and the cross-system contract lock live under `tests/`. A Vitest `globalSetup` runs `prisma db push` against `prisma/test.db` (gitignored); `.env.test` (gitignored) points `DATABASE_URL` at it.
+- **`npm run eval`** — the LLM eval harness in `evals/`. Calls the real OpenAI API, costs tokens, run manually. It exercises the *vendored* rescue prompt, so the eval and the shipped prompt cannot drift. Never wired into `npm test`. See `evals/README.md`.
+
+## AI Rescue Agent — Invariants
+
+These must stay true; breaking one silently degrades the agent.
+
+- **The agent never auto-sends.** Every rescue email is a *draft* posted to Slack for a human to review and send. No node may send email directly. This is the backstop for every other AI failure mode — keep it.
+- **The LLM has exactly one job:** turn structured failure data into one rescue email. Everything before it (Switch on `errorCode`, fix-hint lookup) and after it (schema check, Slack post, re-check activation) is deterministic.
+- **`ErrorCode` string values are a frozen cross-system contract.** The n8n Switch node branches on them — append-only, never rename or remove. Enforced by `tests/contract/error-code-taxonomy.test.ts`.
+- **The canonical rescue prompt lives in `src/lib/rescue-prompt.ts`.** The repo is the source of truth; the n8n workflow is reconciled from it (`N8N-CHECKLIST.md`). Editing the prompt only in n8n's UI would drift it from the evals.
 
 ## Data Models
 

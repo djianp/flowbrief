@@ -1,0 +1,42 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`GET /api/activation-debug — failure context for the agent > matches the frozen response-shape contract the n8n agent depends on 1`] = `
+{
+  "activated": false,
+  "activationDefinition": "user has at least one SUCCESS brief",
+  "lastAttemptAt": "<ISO>",
+  "lastFailure": {
+    "at": "<ISO>",
+    "contentType": "application/json",
+    "errorCode": "MISSING_REQUIRED_FIELD",
+    "errorDetails": {
+      "field": "title",
+      "message": "Required field 'title' is missing",
+    },
+    "headers": {
+      "content-type": "application/json",
+    },
+    "httpMethod": "POST",
+    "path": "/api/ingest/test-user-1",
+    "rawBody": "{"content":"x"}",
+  },
+  "lastReceived": {
+    "at": "<ISO>",
+    "bodySize": 15,
+    "contentType": "application/json",
+    "httpMethod": "POST",
+    "keys": [
+      "content",
+    ],
+    "keysCount": 1,
+  },
+  "ok": true,
+  "recentFailures": [
+    {
+      "at": "<ISO>",
+      "errorCode": "MISSING_REQUIRED_FIELD",
+    },
+  ],
+  "userId": "test-user-1",
+}
+`;

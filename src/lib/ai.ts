@@ -66,7 +66,7 @@ Respond in JSON format:
   };
 }
 
-function generateFallback(inputJson: unknown): BriefResult {
+export function generateFallback(inputJson: unknown): BriefResult {
   const obj = inputJson as Record<string, unknown>;
   const keys = Object.keys(obj);
 

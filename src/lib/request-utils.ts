@@ -1,4 +1,5 @@
 import { NextRequest } from "next/server";
+import { redactString, redactValue } from "./redact";
 
 const HEADER_WHITELIST = [
   "content-type",
@@ -91,7 +92,16 @@ export function extractRequestMeta(
 }
 
 /**
- * Build properties for webhook_failed event
+ * Build properties for webhook_failed event.
+ *
+ * This is the PII/secret redaction chokepoint. A webhook_failed event fans
+ * out to the DB, the /api/activation-debug endpoint, the n8n rescue agent,
+ * the GPT-4o prompt, and the Slack draft — redacting here scrubs every one
+ * of those at once. rawBody is truncated first (to bound the work) then
+ * redacted; errorDetails and headers are redacted recursively. errorCode,
+ * httpMethod, path, and contentType are left as-is: low-risk machine-set
+ * values, and redacting contentType would corrupt the errorDetails.received
+ * comparison the agent shows the user.
  */
 export function buildFailureProperties(
   request: NextRequest,
@@ -103,11 +113,16 @@ export function buildFailureProperties(
 
   return {
     errorCode,
-    errorDetails,
+    errorDetails: redactValue(errorDetails) as Record<string, unknown>,
     httpMethod: request.method,
     path: request.nextUrl.pathname,
     contentType: request.headers.get("content-type") || "",
-    rawBody: rawBody ? truncate(rawBody, MAX_RAW_BODY_LENGTH) : null,
-    headers: pickHeaders(request.headers),
+    rawBody: rawBody
+      ? redactString(truncate(rawBody, MAX_RAW_BODY_LENGTH))
+      : null,
+    headers: redactValue(pickHeaders(request.headers)) as Record<
+      string,
+      string
+    >,
   };
 }
