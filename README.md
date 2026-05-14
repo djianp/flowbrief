@@ -114,7 +114,7 @@ Stripped-down Next.js 16 + SQLite + Prisma + NextAuth v5. The endpoints that mat
 
 ### `POST /api/ingest/[userId]`
 
-The webhook the user's automations point at. Validates method, content-type, payload size (20KB max), user existence, JSON parsing, and schema. Logs every request as `webhook_received`; logs failures additionally as `webhook_failed` with `errorCode`, `rawBody` (truncated), and whitelisted headers.
+The webhook the user's automations point at. Validates method, content-type, payload size (20KB max), user existence, JSON parsing, and schema. Logs every request as `webhook_received`; logs failures additionally as `webhook_failed` with `errorCode`, `rawBody` (truncated and secret-redacted), and whitelisted headers.
 
 **Required:** `title` (string), `content` (string)
 **Optional:** `source` (string), `timestamp` (ISO 8601)
@@ -163,6 +163,7 @@ This is the endpoint the rescue workflow calls before involving the LLM.
 npm install
 cp .env.example .env  # fill in the values below
 npx prisma db push
+npm test               # optional: run the test suite (offline, zero-config)
 npm run dev
 ```
 
@@ -173,7 +174,7 @@ DATABASE_URL="file:./dev.db"
 AUTH_SECRET="..."          # openssl rand -base64 32
 AUTH_URL="http://localhost:3000"
 INTERNAL_API_TOKEN="..."   # used by the n8n agent for /api/activation-debug
-OPENAI_API_KEY="sk-..."    # optional; the agent uses its own n8n credential
+OPENAI_API_KEY="sk-..."    # optional; only needed to run `npm run eval`
 ```
 
 | Variable | Required | Purpose |
@@ -182,7 +183,7 @@ OPENAI_API_KEY="sk-..."    # optional; the agent uses its own n8n credential
 | `AUTH_SECRET` | ✅ | NextAuth session encryption |
 | `AUTH_URL` | ✅ | App base URL |
 | `INTERNAL_API_TOKEN` | ✅ | Auth for `/api/activation-debug` |
-| `OPENAI_API_KEY` | ⛔ | Unused by the ingest path; agent uses its own cred |
+| `OPENAI_API_KEY` | ⛔ | Unused by the ingest path (agent uses its own n8n cred); needed for `npm run eval` |
 
 ---
 
@@ -192,7 +193,20 @@ OPENAI_API_KEY="sk-..."    # optional; the agent uses its own n8n credential
 - **Data:** SQLite via Prisma · NextAuth v5 (credentials, JWT sessions)
 - **Agent:** n8n workflows (managed via Synta MCP) · OpenAI GPT-4o · Slack
 
+## Testing & evals
+
+```bash
+npm test           # Vitest — unit + integration + contract tests. Offline, ~3s.
+npm run eval       # LLM eval harness — hits the OpenAI API, run manually.
+```
+
+`npm test` is zero-config: a Vitest `globalSetup` spins up a throwaway SQLite database and the suite runs fully offline. It covers the validation / error / redaction libraries, the ingest and activation-debug routes, and a lock test that freezes the `errorCode` taxonomy the n8n agent depends on.
+
+`npm run eval` is a separate layer that exercises the **vendored rescue prompt** (`src/lib/rescue-prompt.ts`) against the real OpenAI API — `golden`, `conformance`, `inject`, and `judge` suites. It needs `OPENAI_API_KEY` and costs tokens, so it runs on demand, never as part of `npm test`. See [evals/README.md](./evals/README.md).
+
 ## Further reading
 
 - [FORPIERRE.md](./FORPIERRE.md) — full design notes, architecture decisions, and bug post-mortems (the activation FK crash, the error-taxonomy refactor, the dual-logging design)
+- [N8N-CHECKLIST.md](./N8N-CHECKLIST.md) — the n8n-side guardrails to apply by hand (prompt-injection fencing, output schema validation, timeout/retry, rescue-call ceiling, trigger dedup)
+- [evals/README.md](./evals/README.md) — the LLM eval harness: what each suite checks and how to run it
 - [CLAUDE.md](./CLAUDE.md) — orientation for Claude Code working in this repo

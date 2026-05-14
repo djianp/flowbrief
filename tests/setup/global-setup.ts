@@ -1,4 +1,3 @@
-import { config } from "dotenv";
 import { execSync } from "node:child_process";
 import { rmSync } from "node:fs";
 
@@ -7,7 +6,8 @@ import { rmSync } from "node:fs";
 // have real tables to write to.
 export default function setup(): void {
   // Point DATABASE_URL at the test DB for the `prisma db push` subprocess.
-  config({ path: ".env.test", override: true, quiet: true });
+  // Set in code (not a gitignored env file) so `npm test` is zero-config.
+  process.env.DATABASE_URL = "file:./test.db";
 
   // Start from a pristine schema every run. prisma/test.db is gitignored
   // via "*.db"; { force: true } makes this a no-op when the file is absent.

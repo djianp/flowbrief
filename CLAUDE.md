@@ -58,7 +58,7 @@ npm run db:studio  # Open Prisma Studio
 
 Two layers, kept deliberately separate:
 
-- **`npm test`** — Vitest. Hermetic, offline, fast. Unit tests are co-located as `src/lib/*.test.ts`; integration tests (against a throwaway SQLite DB) and the cross-system contract lock live under `tests/`. A Vitest `globalSetup` runs `prisma db push` against `prisma/test.db` (gitignored); `.env.test` (gitignored) points `DATABASE_URL` at it.
+- **`npm test`** — Vitest. Hermetic, offline, fast, zero-config. Unit tests are co-located as `src/lib/*.test.ts`; integration tests (against a throwaway SQLite DB) and the cross-system contract lock live under `tests/`. A Vitest `globalSetup` runs `prisma db push` against `prisma/test.db` (gitignored); the test environment (`DATABASE_URL`, a fixed test token) is set in code under `tests/setup/`, so there's no env file to create.
 - **`npm run eval`** — the LLM eval harness in `evals/`. Calls the real OpenAI API, costs tokens, run manually. It exercises the *vendored* rescue prompt, so the eval and the shipped prompt cannot drift. Never wired into `npm test`. See `evals/README.md`.
 
 ## AI Rescue Agent — Invariants
