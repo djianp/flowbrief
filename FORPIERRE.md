@@ -404,6 +404,10 @@ This is where the business logic lives. These files don't know about HTTP or Rea
 - `extractRequestMeta(request, rawBody)` — Build metadata object for `webhook_received` events
 - `buildFailureProperties(...)` — Build full context for `webhook_failed` events
 
+**`redact.ts`** — Heuristic PII/secret redaction. `buildFailureProperties` runs every `webhook_failed` event through it, so secrets (bearer tokens, API keys, emails, long digit runs) are scrubbed once — at a single chokepoint — before the event reaches the DB, the debug endpoint, the LLM, and Slack. Covered in depth in *Guardrails and Evals*.
+
+**`rescue-prompt.ts`** — The vendored n8n rescue prompt: the system prompt, the per-error fix hints, the input-assembly function, and the output schema. The repo is the source of truth for what the agent says; the n8n workflow is reconciled from it. Covered in depth in *Guardrails and Evals*.
+
 **`events.ts`** — Analytics/logging. Every webhook received, every brief generated — we log it. The agent reads this log via `/api/activation-debug`.
 
 **`ai.ts`** — The AI integration (currently unused in the ingest path, but available for future features). Has a graceful fallback pattern if OpenAI isn't configured.
@@ -850,7 +854,7 @@ This is crucial for automation. The agent can branch on `errorCode` and take dif
 - [x] **OpenAI credential configured + AI rescue loop tested end-to-end** — Workflow 2 is Published in n8n and running successfully
 - [x] **Published to GitHub** — Repo at https://github.com/djianp/flowbrief; README rewritten to lead with the n8n agent story, FlowBrief framed as the substrate
 - [x] **Next.js security upgrade (16.1.6 → 16.2.6)** — Patched an 18-CVE bundle (HTTP request smuggling, middleware bypass, SSRF, several DoS variants); dodged the npm audit trap that would have downgraded Next to 9.3.3 to silence a transitive postcss warning
-- [x] **Test, eval, and guardrail layer** — A Vitest suite (88 tests: unit, integration against a throwaway SQLite DB, and a frozen-contract lock test); a PII/secret redaction chokepoint; the rescue prompt vendored into `src/lib/rescue-prompt.ts`; and an LLM eval harness (`npm run eval`) with golden / conformance / injection / judge suites that exercise the *exact* shipped prompt. n8n-side guardrails specced in `N8N-CHECKLIST.md`
+- [x] **Test, eval, and guardrail layer** — A Vitest suite (94 tests: unit, integration against a throwaway SQLite DB, and a frozen-contract lock test); a PII/secret redaction chokepoint; the rescue prompt vendored into `src/lib/rescue-prompt.ts`; and an LLM eval harness (`npm run eval`) with golden / conformance / injection / judge suites that exercise the *exact* shipped prompt. n8n-side guardrails specced in `N8N-CHECKLIST.md`
 
 ### Backlog
 
@@ -887,4 +891,4 @@ These are the n8n management tools available via MCP:
 
 ---
 
-*Last updated: May 14, 2026 at 18:48 CET — Added the test, eval, and guardrail layer: a Vitest suite, a PII/secret redaction chokepoint, the rescue prompt vendored into `src/lib/rescue-prompt.ts`, an LLM eval harness, and `N8N-CHECKLIST.md` for the n8n-side guardrails. New sections: "Guardrails and Evals" and the "Redaction That Took 700 Milliseconds" lesson.*
+*Last updated: May 14, 2026 at 19:06 CET — Added the test, eval, and guardrail layer: a Vitest suite (94 tests), a PII/secret redaction chokepoint, the rescue prompt vendored into `src/lib/rescue-prompt.ts`, an LLM eval harness, and `N8N-CHECKLIST.md` for the n8n-side guardrails. New sections: "Guardrails and Evals" and the "Redaction That Took 700 Milliseconds" lesson.*
