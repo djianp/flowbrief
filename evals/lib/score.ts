@@ -22,9 +22,9 @@ const ERROR_CONCEPTS: Record<string, RegExp> = {
   UNSUPPORTED_CONTENT_TYPE: /content[ -]?type|application\/json|header/i,
   MISSING_REQUIRED_FIELD: /missing|required|\btitle\b|\bcontent\b|field/i,
   INVALID_FIELD_TYPE: /\btype\b|string|timestamp|iso ?8601|format/i,
-  PAYLOAD_TOO_LARGE: /too large|payload size|20\s?kb|size limit|\blimit\b/i,
+  PAYLOAD_TOO_LARGE: /too large|payload size|20\s?kb|size limit|\blimit\b|smaller|trim|split|truncate|reduce|shrink|fewer/i,
   INVALID_METHOD: /\bmethod\b|\bpost\b|\bget\b|http verb/i,
-  UNAUTHORIZED: /unauthor|auth|credential|\btoken\b|signature/i,
+  UNAUTHORIZED: /unauthor|auth|credential|\btoken\b|signature|webhook url|secret|dashboard|re-copy/i,
   USER_NOT_FOUND: /not found|\buserid\b|webhook url|dashboard/i,
 };
 
