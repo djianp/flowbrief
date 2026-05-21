@@ -1,3 +1,5 @@
+![FlowBrief — AI rescue for stuck onboardings](./assets/banner.png)
+
 # FlowBrief — an n8n AI agent that rescues stuck onboardings
 
 When a paying customer can't get their first webhook to work, you have a small window before they quietly churn. This repo demos a way to close that window automatically:
