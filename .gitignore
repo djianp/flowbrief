@@ -46,3 +46,12 @@ next-env.d.ts
 # prisma
 *.db
 *.db-journal
+
+# personal interview/study docs — not for the repo
+How-We-Made-an-AI-Agent-Trustworthy.docx
+
+# readable session-transcript backups (local only; may contain secrets/paths)
+/session-backups-readable/
+
+# local-only operator runbooks (may reference tokens, tunnel URLs, n8n internals)
+*.local.md
