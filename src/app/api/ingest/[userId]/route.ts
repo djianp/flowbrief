@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { logEvent } from "@/lib/events";
 import { createBrief } from "@/lib/briefs";
+import { scheduleBriefEnrichment } from "@/lib/brief-enrichment";
 import {
   ErrorCode,
   createErrorResponse,
@@ -169,14 +170,21 @@ export async function POST(
 
   const payload = validation.payload;
 
-  // Create brief from validated payload
-  await createBrief({
+  // Persist the brief synchronously with a placeholder summary (the title) so
+  // the webhook returns immediately AND the activation invariant holds the
+  // moment we return 200 (a valid webhook ⇒ a SUCCESS brief exists). The AI
+  // summary + action items are filled in by a background task after the
+  // response is sent — see scheduleBriefEnrichment. If that enrichment fails,
+  // the brief simply keeps its placeholder summary; the user stays activated.
+  const brief = await createBrief({
     userId: paramUserId,
     status: "SUCCESS",
     inputJson: payload,
     summaryText: payload.title,
     actionItemsJson: [],
   });
+
+  scheduleBriefEnrichment(brief.id, payload);
 
   return NextResponse.json(createSuccessResponse());
 }

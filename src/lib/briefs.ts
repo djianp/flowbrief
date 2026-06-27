@@ -31,6 +31,24 @@ export async function createBrief({
   });
 }
 
+/**
+ * Overwrite a brief's generated content (summary + action items). Used by the
+ * background enrichment job to upgrade a freshly-created brief from its
+ * placeholder summary to the AI-generated one — see `brief-enrichment.ts`.
+ */
+export async function updateBriefContent(
+  id: string,
+  content: { summaryText: string; actionItemsJson: string[] }
+) {
+  return prisma.brief.update({
+    where: { id },
+    data: {
+      summaryText: content.summaryText,
+      actionItemsJson: JSON.stringify(content.actionItemsJson),
+    },
+  });
+}
+
 export async function getUserBriefs(userId: string, limit = 10) {
   return prisma.brief.findMany({
     where: { userId },

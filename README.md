@@ -118,7 +118,7 @@ Stripped-down Next.js 16 + SQLite + Prisma + NextAuth v5. The endpoints that mat
 
 ### `POST /api/ingest/[userId]`
 
-The webhook the user's automations point at. Validates method, content-type, payload size (20KB max), user existence, JSON parsing, and schema. Logs every request as `webhook_received`; logs failures additionally as `webhook_failed` with `errorCode`, `rawBody` (truncated and secret-redacted), and whitelisted headers.
+The webhook the user's automations point at. Validates method, content-type, payload size (20KB max), user existence, JSON parsing, and schema. Logs every request as `webhook_received`; logs failures additionally as `webhook_failed` with `errorCode`, `rawBody` (truncated and secret-redacted), and whitelisted headers. On success it stores a `SUCCESS` brief immediately (so activation is never blocked), then enriches it with an AI summary + action items in a background task (Next `after()`) — the OpenAI call (`gpt-3.5-turbo`) is off the request path and falls back to a deterministic summary when `OPENAI_API_KEY` is unset or the call fails.
 
 **Required:** `title` (string), `content` (string)
 **Optional:** `source` (string), `timestamp` (ISO 8601)
@@ -178,7 +178,7 @@ DATABASE_URL="file:./dev.db"
 AUTH_SECRET="..."          # openssl rand -base64 32
 AUTH_URL="http://localhost:3000"
 INTERNAL_API_TOKEN="..."   # used by the n8n agent for /api/activation-debug
-OPENAI_API_KEY="sk-..."    # optional; only needed to run `npm run eval`
+OPENAI_API_KEY="sk-..."    # optional; enables AI brief generation + `npm run eval`
 ```
 
 | Variable | Required | Purpose |
@@ -187,7 +187,7 @@ OPENAI_API_KEY="sk-..."    # optional; only needed to run `npm run eval`
 | `AUTH_SECRET` | ✅ | NextAuth session encryption |
 | `AUTH_URL` | ✅ | App base URL |
 | `INTERNAL_API_TOKEN` | ✅ | Auth for `/api/activation-debug` |
-| `OPENAI_API_KEY` | ⛔ | Unused by the ingest path (agent uses its own n8n cred); needed for `npm run eval` |
+| `OPENAI_API_KEY` | ⛔ | Optional. Ingest uses it to AI-generate brief summaries + action items; falls back to a deterministic summary if unset. Also needed for `npm run eval`. (The n8n agent uses its own cred.) |
 
 ---
 

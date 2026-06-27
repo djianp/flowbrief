@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterAll } from "vitest";
+import { describe, it, expect, beforeEach, afterAll, vi } from "vitest";
 import {
   POST,
   GET,
@@ -10,10 +10,20 @@ import { ErrorCode } from "@/lib/webhook-errors";
 import { prisma } from "@/lib/prisma";
 import { resetDb, seedUser } from "../helpers/db";
 import { makeIngestRequest } from "../helpers/request";
+import { scheduleBriefEnrichment } from "@/lib/brief-enrichment";
+
+// The route fires brief enrichment as a background task (Next `after()`). In
+// these route-level tests we mock it out so the success path is deterministic
+// (no detached async work racing resetDb) and so we can assert the route
+// schedules it. The real enrichment is covered in brief-enrichment.test.ts.
+vi.mock("@/lib/brief-enrichment", () => ({
+  scheduleBriefEnrichment: vi.fn(),
+}));
 
 const USER_ID = "test-user-1";
 
 beforeEach(async () => {
+  vi.clearAllMocks();
   await resetDb();
   await seedUser({ id: USER_ID });
 });
@@ -103,7 +113,7 @@ describe("POST /api/ingest/[userId] — validation pipeline", () => {
     expect(body.errorCode).toBe(ErrorCode.INVALID_FIELD_TYPE);
   });
 
-  it("accepts a valid payload: 200, a SUCCESS Brief, and a webhook_received event", async () => {
+  it("accepts a valid payload: 200, a SUCCESS Brief (placeholder summary), a webhook_received event, and schedules enrichment", async () => {
     const { request, context } = makeIngestRequest({
       userId: USER_ID,
       body: JSON.stringify({ title: "Order #1", content: "A new order" }),
@@ -115,12 +125,38 @@ describe("POST /api/ingest/[userId] — validation pipeline", () => {
     const briefs = await prisma.brief.findMany({ where: { userId: USER_ID } });
     expect(briefs).toHaveLength(1);
     expect(briefs[0].status).toBe("SUCCESS");
+    // The brief is persisted synchronously with a placeholder summary (the
+    // title) and empty action items, so activation holds the instant we return
+    // 200. The AI summary is filled in by the background job (mocked here, so it
+    // stays at the placeholder).
     expect(briefs[0].summaryText).toBe("Order #1");
+    expect(JSON.parse(briefs[0].actionItemsJson)).toEqual([]);
+
+    // Enrichment is scheduled exactly once, with the new brief id + the
+    // validated payload.
+    expect(scheduleBriefEnrichment).toHaveBeenCalledTimes(1);
+    expect(scheduleBriefEnrichment).toHaveBeenCalledWith(
+      briefs[0].id,
+      expect.objectContaining({ title: "Order #1", content: "A new order" }),
+    );
 
     const received = await prisma.event.findMany({
       where: { userId: USER_ID, eventName: "webhook_received" },
     });
     expect(received).toHaveLength(1);
+  });
+
+  it("does not create a brief or schedule enrichment when the payload is invalid", async () => {
+    const { request, context } = makeIngestRequest({
+      userId: USER_ID,
+      body: JSON.stringify({ content: "no title" }),
+    });
+    const response = await POST(request, context);
+    expect(response.status).toBe(422);
+
+    const briefs = await prisma.brief.findMany({ where: { userId: USER_ID } });
+    expect(briefs).toHaveLength(0);
+    expect(scheduleBriefEnrichment).not.toHaveBeenCalled();
   });
 });
 

@@ -3,11 +3,31 @@ export interface BriefResult {
   actionItemsJson: string[];
 }
 
+/** Hard ceiling on the OpenAI call so a hung request can't stall a webhook. */
+const OPENAI_TIMEOUT_MS = 10_000;
+
+/**
+ * Turn a webhook payload into a brief (summary + action items).
+ *
+ * This is wired into the ingest path, so it MUST be total — it must never
+ * throw. A valid webhook has to produce its SUCCESS brief no matter what:
+ * "activated" is defined as "has ≥ 1 SUCCESS brief", and the whole n8n rescue
+ * agent keys off that. So the LLM is treated as a best-effort enhancement over
+ * a guaranteed-correct fallback: if no key is configured, or the OpenAI call
+ * fails for ANY reason (network, timeout, rate limit, non-JSON response), we
+ * degrade to the deterministic `generateFallback` rather than blocking ingest.
+ */
 export async function generateBrief(inputJson: unknown): Promise<BriefResult> {
   const openaiKey = process.env.OPENAI_API_KEY;
 
   if (openaiKey) {
-    return generateWithOpenAI(inputJson, openaiKey);
+    try {
+      return await generateWithOpenAI(inputJson, openaiKey);
+    } catch (err) {
+      // Never let an AI hiccup turn a valid webhook into a non-activation.
+      console.error("generateBrief: OpenAI path failed, using fallback —", err);
+      return generateFallback(inputJson);
+    }
   }
 
   return generateFallback(inputJson);
@@ -32,38 +52,51 @@ Respond in JSON format:
   "actionItems": ["action 1", "action 2", ...]
 }`;
 
-  const response = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify({
-      model: "gpt-3.5-turbo",
-      messages: [{ role: "user", content: prompt }],
-      temperature: 0.7,
-      max_tokens: 500,
-    }),
-  });
+  // Abort the request if OpenAI is slow — the fallback is instant and ingest
+  // latency matters (webhook senders time out).
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), OPENAI_TIMEOUT_MS);
 
-  if (!response.ok) {
-    const error = await response.text();
-    throw new Error(`OpenAI API error: ${error}`);
+  try {
+    const response = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model: "gpt-3.5-turbo",
+        messages: [{ role: "user", content: prompt }],
+        temperature: 0.7,
+        max_tokens: 500,
+        // Force well-formed JSON so JSON.parse below can't choke on prose or
+        // markdown fences. (Any model that rejects this just routes to fallback.)
+        response_format: { type: "json_object" },
+      }),
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      const error = await response.text();
+      throw new Error(`OpenAI API error: ${error}`);
+    }
+
+    const data = await response.json();
+    const content = data.choices?.[0]?.message?.content;
+
+    if (!content) {
+      throw new Error("No content in OpenAI response");
+    }
+
+    const parsed = JSON.parse(content);
+
+    return {
+      summaryText: parsed.summary || "Summary unavailable",
+      actionItemsJson: parsed.actionItems || [],
+    };
+  } finally {
+    clearTimeout(timer);
   }
-
-  const data = await response.json();
-  const content = data.choices?.[0]?.message?.content;
-
-  if (!content) {
-    throw new Error("No content in OpenAI response");
-  }
-
-  const parsed = JSON.parse(content);
-
-  return {
-    summaryText: parsed.summary || "Summary unavailable",
-    actionItemsJson: parsed.actionItems || [],
-  };
 }
 
 export function generateFallback(inputJson: unknown): BriefResult {

@@ -34,7 +34,8 @@ src/
 │   ├── redact.ts            # PII/secret redaction (applied in request-utils)
 │   ├── rescue-prompt.ts     # Vendored n8n rescue prompt — single source of truth
 │   ├── events.ts            # Event tracking utilities
-│   └── ai.ts                # AI/LLM integration (unused in ingest path)
+│   ├── ai.ts                # AI brief generation (OpenAI + offline fallback)
+│   └── brief-enrichment.ts  # Background brief enrichment (Next after(), runs post-response)
 └── prisma/
     └── schema.prisma        # Database schema
 
@@ -83,7 +84,7 @@ Required in `.env`:
 - `AUTH_SECRET` - NextAuth secret
 - `AUTH_URL` - Base URL of the app (e.g., `http://localhost:3000`)
 - `INTERNAL_API_TOKEN` - Secret token for `/api/activation-debug` endpoint
-- `OPENAI_API_KEY` - (optional) OpenAI key for AI features
+- `OPENAI_API_KEY` - (optional) OpenAI key. The ingest path uses it to generate each brief's summary + action items; without it, ingest falls back to a deterministic offline summary. Also needed for `npm run eval`. (The n8n rescue agent uses its own credential, not this one.)
 
 ## Standing Instructions
 

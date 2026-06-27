@@ -410,7 +410,9 @@ This is where the business logic lives. These files don't know about HTTP or Rea
 
 **`events.ts`** — Analytics/logging. Every webhook received, every brief generated — we log it. The agent reads this log via `/api/activation-debug`.
 
-**`ai.ts`** — The AI integration (currently unused in the ingest path, but available for future features). Has a graceful fallback pattern if OpenAI isn't configured.
+**`ai.ts`** — AI brief generation. `generateBrief()` turns a payload into a summary + action items via OpenAI (`gpt-3.5-turbo`), degrading to a deterministic, offline fallback when `OPENAI_API_KEY` is unset or the call fails. It is *total* — it never throws. It's invoked by the background enricher, not the request path.
+
+**`brief-enrichment.ts`** — The background job that upgrades a freshly-ingested brief from its placeholder summary to the generated one. The ingest route creates the SUCCESS brief synchronously, then calls `scheduleBriefEnrichment()` (Next's `after()`) so `enrichBrief()` runs *after* the response is sent. Covered in depth in *The Graceful Fallback Pattern*.
 
 ### `/src/app/api` — The endpoints
 
@@ -425,7 +427,7 @@ This endpoint implements a strict validation pipeline:
 5. **JSON parse** — Body must be valid JSON (returns `INVALID_JSON`)
 6. **Schema validation** — Must have `title` and `content` fields (returns `MISSING_REQUIRED_FIELD` or `INVALID_FIELD_TYPE`)
 7. **Logging** — Every request logs `webhook_received`; failures also log `webhook_failed` with error details. Unknown users get `userId: null` with `attemptedUserId` in properties.
-8. **Save** — Valid payloads are stored as Briefs
+8. **Save + enrich** — Valid payloads are stored *immediately* as a SUCCESS Brief with a placeholder summary (so activation isn't blocked), then enriched with an AI summary + action items by a background task (`scheduleBriefEnrichment` → Next `after()`, off the request path)
 9. **Return** — `{ ok: true }` on success, `{ ok: false, errorCode, errorDetails }` on failure
 
 **`/api/activation-status/route.ts`** — The simple yes/no check. "Has this user successfully sent at least one valid webhook?" Public endpoint; used by the dashboard ("Set up your webhook!" vs "You're all set!") and by Workflow 1's basic SLA check.
@@ -505,7 +507,7 @@ interface WebhookPayload {
 
 Why these fields?
 
-- **`title`** — Every brief needs a headline. This becomes the `summaryText` in the database.
+- **`title`** — A short headline for the event. (It used to be copied verbatim into `summaryText`; now `summaryText` is produced by `generateBrief()` from the whole payload — see *The Graceful Fallback Pattern*.)
 - **`content`** — The actual information. Up to 20KB.
 - **`source`** — Useful for filtering/grouping ("Stripe? Calendar? Form?")
 - **`timestamp`** — When the event *actually* happened, not when we received it. Important for audit trails.
@@ -731,29 +733,45 @@ export const { auth } = NextAuth({
 
 Without this, you'll get cryptic errors about missing session tokens.
 
-### The Graceful Fallback Pattern
+### The Graceful Fallback Pattern (and why brief generation moved to a background job)
 
-Look at `ai.ts`:
+Brief generation went through two revisions worth understanding together.
+
+**First cut: call the LLM inline.** The ingest route ran the payload through `generateBrief()` and stored the result. `generateBrief()` is built to be **total** — it never throws:
 
 ```typescript
 export async function generateBrief(inputJson: unknown): Promise<BriefResult> {
   const openaiKey = process.env.OPENAI_API_KEY;
 
   if (openaiKey) {
-    return generateWithOpenAI(inputJson, openaiKey);
+    try {
+      return await generateWithOpenAI(inputJson, openaiKey);
+    } catch (err) {
+      // Never let an AI hiccup turn a valid webhook into a non-activation.
+      console.error("generateBrief: OpenAI path failed, using fallback —", err);
+      return generateFallback(inputJson);
+    }
   }
-
-  return generateFallback(inputJson);  // Works without API key!
+  return generateFallback(inputJson);  // Works without an API key!
 }
 ```
 
-This is a **graceful degradation** pattern. The app doesn't break if OpenAI isn't configured — it just does something simpler. Benefits:
+This is **graceful degradation**, and here it's load-bearing. The reason it *must* never throw is subtle: "activated" is defined as "the user has ≥ 1 SUCCESS brief," and the entire n8n rescue agent keys off that. If an OpenAI rate-limit bubbled up, a *valid* webhook would 500 and create no brief — the user would look "stuck" despite doing everything right, and the agent would fire a rescue email diagnosing a failure that never happened. (There's also a 10-second `AbortController` timeout inside `generateWithOpenAI` — the fallback is instant and webhook senders time out.)
 
-- New developers can run the project immediately (no API key signup required)
-- If OpenAI goes down, the app still works
-- Tests don't need mocked API responses
+**Second cut: move the LLM call off the request path.** Even with the timeout, putting a 1–4s network call inline made the webhook slow and chained its latency to OpenAI. So generation became a background job, and the route split into two steps:
 
-**Lesson:** Always ask "What if this dependency fails?" and have a fallback plan.
+1. **Synchronously** create the SUCCESS brief with a *placeholder* summary (the title). The activation invariant now holds the instant the webhook returns 200 — it no longer depends on the AI at all.
+2. **After the response** (`scheduleBriefEnrichment` → Next's `after()`), `enrichBrief()` calls `generateBrief()` and upgrades the row from placeholder to AI summary.
+
+That gives **two independent layers of safety**: the invariant is guaranteed by step 1 (no AI involved), and `enrichBrief()` is *also* total, so a failed enrichment just leaves the placeholder in place. Observed end-to-end: the webhook returns in ~0.5s with the title as the summary; a few seconds later the brief upgrades to the AI summary + action items.
+
+Benefits:
+
+- New developers can run the project immediately (no API key required — the fallback is offline)
+- The webhook is fast and never blocks on OpenAI; if OpenAI is down or slow, ingestion is unaffected and the brief simply keeps its placeholder
+- The fast test suite stays offline: `tests/setup/env.ts` clears `OPENAI_API_KEY`; the route tests mock `scheduleBriefEnrichment`; and `enrichBrief` + the OpenAI branch are covered against the test DB with a stubbed `fetch`
+
+**Lesson:** When you add a flaky/slow dependency to a path that carries a *correctness invariant* (a valid webhook must activate the user) **and** a latency budget (webhook senders time out), don't just make its failure a no-op — get it off the critical path entirely. Persist the invariant-satisfying record first, then enrich asynchronously. Ask "what breaks if this throws *or* hangs?" — and if the answer touches an invariant, make sure neither can reach it.
 
 ### The npm Audit Trap: When the Cure Is Worse Than the Disease
 
@@ -907,4 +925,4 @@ These are the n8n management tools available via MCP:
 
 ---
 
-*Last updated: May 15, 2026 at 22:56 CET — Strengthened `RESCUE_SYSTEM_PROMPT` to close a prompt-injection hole the `inject` eval surfaced on its first real run (a "SYSTEM:" directive inside fenced data was being followed). New lesson: "The Eval That Did Its Job".*
+*Last updated: June 27, 2026 at 21:00 CET — Moved AI brief generation to a background job. The ingest route now persists the SUCCESS brief synchronously with a placeholder summary (activation holds immediately), then enriches it after the response via Next's `after()` (`brief-enrichment.ts`) — so the webhook returns in ~0.5s instead of waiting on OpenAI, and an OpenAI failure/hang can't touch the activation invariant. `generateBrief()` stays total (try/catch → fallback + 10s timeout). Added `tests/integration/brief-enrichment.test.ts`; route tests mock the scheduler. Updated lesson: "The Graceful Fallback Pattern (and why brief generation moved to a background job)".*
